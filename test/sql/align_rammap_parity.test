@@ -1,0 +1,55 @@
+# name: test/sql/align_rammap_parity.test
+# description: Verify align_rammap output matches standalone rammap CLI (v1.1.2) field-by-field
+# group: [sql]
+
+# Ground truth generated with:
+#   rammap -x sr -a --eqx --MD ref.fa reads.fq
+#   rammap version: 1.1.2 (jwanglab/rammap, rammap-core)
+# Test data: same 2-subject / 2-query fixture as align_minimap2.test.
+# This is the parity contract this feature exists to satisfy: align_rammap
+# routes through rammap-core's own pipeline::align_and_format_query (the
+# function the CLI itself calls — see rammap_ffi.rs), so this test is
+# expected to hold by construction, not by coincidence. If it ever fails,
+# suspect a change to rammap_ffi.rs's option derivation (preset/k/w/eqx/
+# mid_occ handling), not a rammap-core upgrade alone.
+#
+# NOTE: this hardcodes literal golden values directly in the test file
+# (small fixture) rather than a separate SHA-pinned oracle blob (contrast
+# data/sortmerna/real_oracle.blast.gz / data/fasttree/*.golden.nwk). Graduate
+# to that pattern if/when this test grows a larger fixture.
+
+require miint
+
+require-env RAMMAP_AVAILABLE
+
+statement ok
+CREATE TABLE subjects AS SELECT * FROM (VALUES
+    ('ref1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCC'),
+    ('ref2', 'TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCAAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAA')
+) AS t(read_id, sequence1);
+
+statement ok
+CREATE TABLE queries AS SELECT * FROM (VALUES
+    ('query1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT'),
+    ('query2', 'TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA')
+) AS t(read_id, sequence1);
+
+query I
+SELECT count(*) FROM align_rammap('queries', subject_table:='subjects');
+----
+2
+
+# Columns: read_id, flags, reference, position, stop_position, mapq, cigar, tag_as, tag_nm, tag_md
+query IIIIIITIII
+SELECT read_id, flags, reference, position, stop_position, mapq, cigar, tag_as, tag_nm, tag_md
+FROM align_rammap('queries', subject_table:='subjects')
+ORDER BY read_id;
+----
+query1	16	ref1	1	53	3	52=	104	0	52
+query2	0	ref2	1	53	4	52=	104	0	52
+
+statement ok
+DROP TABLE subjects;
+
+statement ok
+DROP TABLE queries;

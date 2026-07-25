@@ -1,0 +1,24 @@
+# NOTE(miint): this is a local vendor of jwanglab/rammap (source only, no
+# .git) for early prototyping of align_rammap. It will be replaced by a git
+# submodule (a the-miint/rammap fork or pinned upstream tag) before this
+# lands on a shared branch. The `rammap` CLI crate is intentionally not
+# vendored here — only rammap-core (the library) is needed — so the
+# workspace member list below is trimmed accordingly; a submodule swap would
+# restore the full member list.
+[workspace]
+resolver = "2"
+members = ["rammap-core"]
+
+[workspace.package]
+version = "1.1.2"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/jwanglab/rammap"
+# Shared across both crates; the path is resolved relative to the workspace root.
+readme = "README.md"
+
+# Shared release profile (applies to all workspace members).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

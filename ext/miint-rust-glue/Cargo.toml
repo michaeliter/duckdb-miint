@@ -25,9 +25,16 @@ with-sylph = ["dep:sylph"]
 # Off on WASM (no needletail) and Windows (cdylib of needletail triggers MSVC
 # linker errors per the historical comment in CMakeLists.txt).
 rype-fastx = ["rype/fastx"]
+# Enable rammap (align_rammap). rammap-core ships no FFI of its own — the
+# extern "C" surface lives in this crate's rammap_ffi.rs, gated by this
+# feature so a rammap-less build doesn't pay the compile cost.
+with-rammap = ["dep:rammap-core"]
 
 [dependencies]
 # arrow-ffi is always required: the extension uses Arrow C Data Interface
 # entry points from both crates (rype's classify + sylph_profile).
 rype  = { path = "../rype",  default-features = false, features = ["arrow-ffi"] }
 sylph = { path = "../sylph", default-features = false, features = ["arrow-ffi"], optional = true }
+# NOTE(miint): ext/rammap is a local vendor of jwanglab/rammap (see
+# ext/rammap/Cargo.toml) pending a submodule swap to a pinned fork/tag.
+rammap-core = { path = "../rammap/rammap-core", default-features = false, features = ["parallel"], optional = true }

@@ -8,3 +8,9 @@ extern crate rype as _;
 
 #[cfg(feature = "with-sylph")]
 extern crate sylph as _;
+
+// Unlike rype/sylph (which each ship their own arrow-ffi extern "C" surface
+// upstream), rammap-core has no FFI of its own — this crate owns it. See
+// rammap_ffi.rs for why (parity with the standalone rammap CLI).
+#[cfg(feature = "with-rammap")]
+mod rammap_ffi;

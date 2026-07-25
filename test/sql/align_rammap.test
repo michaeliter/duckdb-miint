@@ -1,0 +1,179 @@
+# name: test/sql/align_rammap.test
+# description: Test align_rammap table function
+# group: [sql]
+
+require miint
+
+require-env RAMMAP_AVAILABLE
+
+# Setup: Create test tables with sequence data (same fixture as align_minimap2.test)
+
+statement ok
+CREATE TABLE subjects AS SELECT * FROM (VALUES
+    ('ref1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCC'),
+    ('ref2', 'TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCAAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAA')
+) AS t(read_id, sequence1);
+
+statement ok
+CREATE TABLE queries AS SELECT * FROM (VALUES
+    ('query1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT'),
+    ('query2', 'TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA')
+) AS t(read_id, sequence1);
+
+# Test basic alignment
+query IIII
+SELECT read_id, reference, position, mapq >= 0 as has_mapq
+FROM align_rammap('queries', subject_table='subjects')
+ORDER BY read_id, reference;
+----
+query1	ref1	1	true
+query2	ref2	1	true
+
+# Test CIGAR string is generated
+query II
+SELECT read_id, cigar != '*' AND cigar != '' as has_cigar
+FROM align_rammap('queries', subject_table='subjects')
+ORDER BY read_id;
+----
+query1	true
+query2	true
+
+# Test with EQX mode (default is on, so CIGAR should have = for matches)
+query II
+SELECT read_id, cigar LIKE '%=%' as has_eq_op
+FROM align_rammap('queries', subject_table='subjects')
+ORDER BY read_id;
+----
+query1	true
+query2	true
+
+# Test alignment score tag — populated directly from rammap's own AS:i tag
+# (no reconstruction in C++, see RammapAligner.cpp / rammap_ffi.rs).
+query II
+SELECT read_id, tag_as > 0 as has_score
+FROM align_rammap('queries', subject_table='subjects')
+ORDER BY read_id;
+----
+query1	true
+query2	true
+
+# NM/MD are populated directly from rammap's own NM:i/MD:Z tags — exact
+# match, so NM=0 and MD is a plain match-length run (no substitutions).
+query III
+SELECT read_id, tag_nm, tag_md
+FROM align_rammap('queries', subject_table='subjects')
+ORDER BY read_id;
+----
+query1	0	52
+query2	0	52
+
+# Non-native tags (not emitted by rammap's SAM output — see rammap_ffi.rs)
+# are NULL rather than reconstructed, unlike align_minimap2's XM/XO/XG walk.
+query IIIII
+SELECT read_id, tag_xs, tag_ys, tag_xn, tag_yt
+FROM align_rammap('queries', subject_table='subjects')
+ORDER BY read_id;
+----
+query1	NULL	NULL	NULL	NULL
+query2	NULL	NULL	NULL	NULL
+
+# Test stop_position is computed
+query III
+SELECT read_id, position, stop_position >= position as stop_after_start
+FROM align_rammap('queries', subject_table='subjects')
+ORDER BY read_id;
+----
+query1	1	true
+query2	1	true
+
+# Test with different preset (map-ont uses smaller k, so still aligns).
+# DISTINCT because these fixture sequences are periodic/repetitive enough
+# that map-ont's more permissive seeding reports multiple (near-)equally
+# good alignments per query — real aligner behavior on a pathological
+# fixture, not a bug. Hit-count precision is covered by the default-preset
+# tests above; this test only checks the preset still resolves correctly.
+query II
+SELECT DISTINCT read_id, reference
+FROM align_rammap('queries', subject_table='subjects', preset='map-ont')
+ORDER BY read_id;
+----
+query1	ref1
+query2	ref2
+
+# Test with views
+statement ok
+CREATE VIEW query_view AS SELECT * FROM queries;
+
+statement ok
+CREATE VIEW subject_view AS SELECT * FROM subjects;
+
+query II
+SELECT read_id, reference
+FROM align_rammap('query_view', subject_table='subject_view')
+ORDER BY read_id;
+----
+query1	ref1
+query2	ref2
+
+# Test error: missing subject_table
+statement error
+SELECT * FROM align_rammap('queries');
+----
+requires subject_table
+
+# Test error: non-existent query table
+statement error
+SELECT * FROM align_rammap('nonexistent_table', subject_table='subjects');
+----
+does not exist
+
+# Test error: non-existent subject table
+statement error
+SELECT * FROM align_rammap('queries', subject_table='nonexistent_table');
+----
+does not exist
+
+# Test error: unrecognized preset
+statement error
+SELECT * FROM align_rammap('queries', subject_table='subjects', preset='not-a-real-preset');
+----
+Failed to build rammap index
+
+# Clean up
+statement ok
+DROP TABLE subjects;
+
+statement ok
+DROP TABLE queries;
+
+statement ok
+DROP VIEW query_view;
+
+statement ok
+DROP VIEW subject_view;
+
+# Test: Multi-threaded alignment with 100 queries
+statement ok
+CREATE TABLE mt_subjects AS SELECT * FROM (VALUES
+    ('ref1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCC')
+) AS t(read_id, sequence1);
+
+statement ok
+CREATE TABLE mt_queries AS
+    SELECT 'q' || i AS read_id,
+           substr('ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCC',
+                  1 + (i % 51), 50) AS sequence1
+    FROM generate_series(1, 100) AS t(i);
+
+query I
+SELECT COUNT(DISTINCT read_id) = 100
+FROM align_rammap('mt_queries', subject_table='mt_subjects')
+WHERE reference = 'ref1';
+----
+true
+
+statement ok
+DROP TABLE mt_subjects;
+
+statement ok
+DROP TABLE mt_queries;

@@ -356,6 +356,14 @@ fi
 if echo "SELECT 1 FROM duckdb_functions() WHERE function_name = 'sylph_profile';" | ./build/release/duckdb -csv -noheader 2>/dev/null | grep -q 1; then
     export SYLPH_AVAILABLE=1
 fi
+if echo "SELECT 1 FROM duckdb_functions() WHERE function_name = 'align_rammap';" | ./build/release/duckdb -csv -noheader 2>/dev/null | grep -q 1; then
+    export RAMMAP_AVAILABLE=1
+fi
+# Standalone rammap CLI binary, for the align_rammap parity oracle (byte-identical
+# SAM comparison against test/sql/align_rammap_parity.test's committed golden fixture).
+if command -v rammap >/dev/null 2>&1; then
+    export RAMMAP_CLI_AVAILABLE=1
+fi
 # libcurl streaming-upload transport (off on macOS — vsearch/OpenSSL symbol clash).
 if echo "SELECT 1 FROM miint_versions() WHERE library = 'libcurl';" | ./build/release/duckdb -csv -noheader 2>/dev/null | grep -q 1; then
     export MIINT_HAS_CURL=1

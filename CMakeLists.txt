@@ -106,6 +106,7 @@ option(MIINT_ENABLE_MAFFT "Build with MAFFT multiple sequence alignment support"
 option(MIINT_ENABLE_ABPOA "Build with abPOA partial-order alignment support" ON)
 option(MIINT_ENABLE_SORTMERNA "Build with SortMeRNA rRNA alignment support" ON)
 option(MIINT_ENABLE_SYLPH "Build with sylph FracMinHash relative-abundance profiling" ON)
+option(MIINT_ENABLE_RAMMAP "Build with rammap alignment support (align_rammap)" ON)
 option(MIINT_ENABLE_GPL_BOUNDARY "Build with gpl-boundary subsystem (process pipes + Arrow IPC over POSIX shm)" ON)
 option(MIINT_ENABLE_UNIFRAC "Build with UniFrac (PCoA / PERMANOVA / Faith PD) support" ON)
 
@@ -205,21 +206,27 @@ if(EMSCRIPTEN)
     set(MIINT_ENABLE_HDF5 OFF)
     set(MIINT_ENABLE_SORTMERNA OFF)
     set(MIINT_ENABLE_SYLPH OFF)
+    set(MIINT_ENABLE_RAMMAP OFF)
     set(MIINT_ENABLE_GPL_BOUNDARY OFF)
-    message(STATUS "Emscripten detected: disabling HDF5, SortMeRNA, sylph, and gpl-boundary (WASM-incompatible)")
+    message(STATUS "Emscripten detected: disabling HDF5, SortMeRNA, sylph, rammap, and gpl-boundary (WASM-incompatible)")
 elseif(WIN32)
     set(MIINT_ENABLE_MAFFT OFF)
     set(MIINT_ENABLE_ABPOA OFF)
     set(MIINT_ENABLE_SYLPH OFF)
+    set(MIINT_ENABLE_RAMMAP OFF)
     set(MIINT_ENABLE_GPL_BOUNDARY OFF)
     set(MIINT_ENABLE_UNIFRAC OFF)
     if(MINGW)
         set(MIINT_ENABLE_SORTMERNA OFF)
-        message(STATUS "MinGW detected: disabling MAFFT, SortMeRNA, sylph, gpl-boundary, and UniFrac (cmph + gpl-boundary rely on POSIX APIs; libssu inmem assumes POSIX)")
+        message(STATUS "MinGW detected: disabling MAFFT, SortMeRNA, sylph, rammap, gpl-boundary, and UniFrac (cmph + gpl-boundary rely on POSIX APIs; libssu inmem assumes POSIX)")
     else()
-        message(STATUS "Windows detected: disabling MAFFT, sylph, gpl-boundary, and UniFrac (require POSIX APIs)")
+        message(STATUS "Windows detected: disabling MAFFT, sylph, rammap, gpl-boundary, and UniFrac (require POSIX APIs)")
     endif()
 endif()
+# rammap (align_rammap) is untested on WASM/Windows targets so far — the
+# umbrella glue crate's WASM/MinGW cargo target flags (see GLUE_* below) have
+# not been validated against rammap-core's own platform assumptions. Disabled
+# above pending that verification; native Linux/macOS stay on by default.
 
 # HDF5 is required for BIOM support, but can be disabled entirely or made optional for clang-tidy
 if(MIINT_ENABLE_HDF5)
@@ -352,7 +359,15 @@ if(NOT SYLPH_GIT_VERSION)
     set(SYLPH_GIT_VERSION "unknown")
 endif()
 
-message(STATUS "Submodule versions: minimap2=${MINIMAP2_GIT_VERSION} WFA2=${WFA2_GIT_VERSION} rype=${RYPE_GIT_VERSION} vsearch=${VSEARCH_GIT_VERSION} mafft=${MAFFT_GIT_VERSION} abpoa=${ABPOA_GIT_VERSION} sylph=${SYLPH_GIT_VERSION} unifrac=${UNIFRAC_GIT_VERSION} skbb=${SKBB_GIT_VERSION}")
+# ext/rammap is a local source vendor (no .git of its own) during align_rammap
+# prototyping, not yet a submodule — see ext/rammap/Cargo.toml. `git describe`
+# there would silently walk up and resolve to duckdb-miint's own tag instead
+# of erroring, so hardcode the vendored version rather than risk that
+# misattribution. Replace with a real `git describe` block (matching the
+# pattern above) once ext/rammap becomes a submodule.
+set(RAMMAP_GIT_VERSION "vendored-1.1.2-local")
+
+message(STATUS "Submodule versions: minimap2=${MINIMAP2_GIT_VERSION} WFA2=${WFA2_GIT_VERSION} rype=${RYPE_GIT_VERSION} vsearch=${VSEARCH_GIT_VERSION} mafft=${MAFFT_GIT_VERSION} abpoa=${ABPOA_GIT_VERSION} sylph=${SYLPH_GIT_VERSION} unifrac=${UNIFRAC_GIT_VERSION} skbb=${SKBB_GIT_VERSION} rammap=${RAMMAP_GIT_VERSION}")
 
 # Build htslib from release tarball
 # Configure with zstd support if available (htslib autodetects via pkg-config)
@@ -1022,6 +1037,9 @@ endif()
 if(MIINT_ENABLE_SYLPH)
     list(APPEND GLUE_FEATURES "with-sylph")
 endif()
+if(MIINT_ENABLE_RAMMAP)
+    list(APPEND GLUE_FEATURES "with-rammap")
+endif()
 string(REPLACE ";" "," GLUE_FEATURES_CSV "${GLUE_FEATURES}")
 if(GLUE_FEATURES_CSV)
     set(GLUE_FEATURES_ARGS "--features" "${GLUE_FEATURES_CSV}")
@@ -1355,6 +1373,9 @@ endif()
 if(MIINT_ENABLE_SYLPH)
     list(APPEND EXTENSION_SOURCES src/SylphDatabase.cpp src/sylph_profile.cpp src/sylph_index_create.cpp)
 endif()
+if(MIINT_ENABLE_RAMMAP)
+    list(APPEND EXTENSION_SOURCES src/RammapAligner.cpp src/align_rammap.cpp)
+endif()
 if(MIINT_ENABLE_CURL)
     list(APPEND EXTENSION_SOURCES src/curl_send.cpp)
 endif()
@@ -1466,6 +1487,10 @@ endif()
 if(MIINT_ENABLE_SYLPH)
     target_compile_definitions(${EXTENSION_NAME} PRIVATE MIINT_HAS_SYLPH
         SYLPH_GIT_VERSION="${SYLPH_GIT_VERSION}")
+endif()
+if(MIINT_ENABLE_RAMMAP)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE MIINT_HAS_RAMMAP
+        RAMMAP_GIT_VERSION="${RAMMAP_GIT_VERSION}")
 endif()
 if(MIINT_ENABLE_CURL)
     target_compile_definitions(${EXTENSION_NAME} PRIVATE MIINT_HAS_CURL)
@@ -1605,6 +1630,10 @@ endif()
 if(MIINT_ENABLE_SYLPH)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MIINT_HAS_SYLPH
         SYLPH_GIT_VERSION="${SYLPH_GIT_VERSION}")
+endif()
+if(MIINT_ENABLE_RAMMAP)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MIINT_HAS_RAMMAP
+        RAMMAP_GIT_VERSION="${RAMMAP_GIT_VERSION}")
 endif()
 if(MIINT_ENABLE_CURL)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MIINT_HAS_CURL)
@@ -1844,6 +1873,15 @@ if(MIINT_ENABLE_SYLPH)
         src/SylphDatabase.cpp
         test/cpp/test_SylphDatabase.cpp)
 endif()
+if(MIINT_ENABLE_RAMMAP)
+    # Same split as sylph above: RammapAligner.cpp (the rammap_ffi.h wrapper)
+    # is self-contained and unit-testable; align_rammap.cpp (the DuckDB table
+    # function) depends on DuckDB internals and is covered by the SQL tests
+    # instead.
+    list(APPEND TEST_SOURCES
+        src/RammapAligner.cpp
+        test/cpp/test_RammapAligner.cpp)
+endif()
 if(MIINT_ENABLE_CURL)
     list(APPEND TEST_SOURCES src/curl_send.cpp test/cpp/test_curl_send.cpp)
 endif()
@@ -1909,11 +1947,18 @@ if(MIINT_ENABLE_SORTMERNA)
     target_link_libraries(tests sortmerna RocksDB::rocksdb)
     target_compile_definitions(tests PRIVATE MIINT_HAS_SORTMERNA)
 endif()
-if(MIINT_ENABLE_SYLPH)
+if(MIINT_ENABLE_SYLPH OR MIINT_ENABLE_RAMMAP)
     # Link rype (the umbrella archive), which transitively provides sylph
-    # symbols — see comment near the rype IMPORTED target declaration.
+    # and/or rammap symbols — see comment near the rype IMPORTED target
+    # declaration (a second IMPORTED target pointing at the same archive
+    # caused double-link corruption; always link via the `rype` target name).
     target_link_libraries(tests rype)
+endif()
+if(MIINT_ENABLE_SYLPH)
     target_compile_definitions(tests PRIVATE MIINT_HAS_SYLPH)
+endif()
+if(MIINT_ENABLE_RAMMAP)
+    target_compile_definitions(tests PRIVATE MIINT_HAS_RAMMAP)
 endif()
 if(MIINT_ENABLE_GPL_BOUNDARY)
     target_sources(tests PRIVATE $<TARGET_OBJECTS:miint_nanoarrow_ipc>)

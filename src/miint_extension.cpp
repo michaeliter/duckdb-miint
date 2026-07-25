@@ -101,6 +101,9 @@
 #include <sylph_index_create.hpp>
 #include <sylph_profile.hpp>
 #endif
+#ifdef MIINT_HAS_RAMMAP
+#include <align_rammap.hpp>
+#endif
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/storage/storage_extension.hpp>
@@ -207,6 +210,9 @@ static unique_ptr<FunctionData> MiintVersionsBind(ClientContext &context, TableF
 #ifdef MIINT_HAS_SYLPH
 	data->versions.emplace_back("sylph", SYLPH_GIT_VERSION);
 #endif
+#ifdef MIINT_HAS_RAMMAP
+	data->versions.emplace_back("rammap", RAMMAP_GIT_VERSION);
+#endif
 #ifdef MIINT_HAS_UNIFRAC
 	data->versions.emplace_back("unifrac", UNIFRAC_GIT_VERSION);
 	data->versions.emplace_back("scikit-bio-binaries", SKBB_GIT_VERSION);
@@ -278,6 +284,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	PhyloAncestralMLTableFunction::Register(loader);
 	AlignMinimap2TableFunction::Register(loader);
 	AlignMinimap2ShardedTableFunction::Register(loader);
+#ifdef MIINT_HAS_RAMMAP
+	AlignRammapTableFunction::Register(loader);
+#endif
 	SaveMinimap2IndexTableFunction::Register(loader);
 #ifdef MIINT_HAS_GPL_BOUNDARY
 	AlignBowtie2TableFunction::Register(loader);
