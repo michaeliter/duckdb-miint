@@ -1343,6 +1343,18 @@ set(EXTENSION_SOURCES
     src/hfile_duckdb.cpp
     src/deblur.cpp
     src/deblur_table_function.cpp
+    src/simulate_resemblance.cpp
+    src/simulate_resemblance_function.cpp
+    src/community_distances.cpp
+    src/cluster_kmeans.cpp
+    src/cluster_upgma.cpp
+    # Generic (UniFrac-independent) table readers, and the beta-diversity /
+    # ordination wrappers that use them. Always compiled: nothing here links
+    # libssu or libskbb.
+    src/unifrac_function_common.cpp
+    src/community_distances_function.cpp
+    src/cluster_kmeans_function.cpp
+    src/cluster_upgma_function.cpp
     src/per_sample_table_function.cpp
     src/id_column_codec.cpp
     src/extract_linked_amplicon.cpp
@@ -1400,7 +1412,6 @@ if(MIINT_ENABLE_UNIFRAC)
         src/unifrac_distance.cpp
         src/unifrac_omp_scope.cpp
         src/unifrac_subsample_bridge.cpp
-        src/unifrac_function_common.cpp
         src/unifrac_pcoa_function.cpp
         src/unifrac_permanova_function.cpp
         src/unifrac_faith_pd_function.cpp
@@ -1755,6 +1766,15 @@ set(TEST_SOURCES
     test/cpp/test_AncestralStatesContinuous.cpp
     test/cpp/test_AncestralStatesParsimony.cpp
     test/cpp/test_AncestralStatesML.cpp
+    src/simulate_resemblance.cpp
+    test/cpp/test_SimulateGradient.cpp
+    test/cpp/test_SimulateCluster.cpp
+    src/community_distances.cpp
+    test/cpp/test_CommunityDistances.cpp
+    src/cluster_kmeans.cpp
+    test/cpp/test_ClusterKmeans.cpp
+    src/cluster_upgma.cpp
+    test/cpp/test_ClusterUpgma.cpp
     src/Minimap2Aligner.cpp
     test/cpp/test_Minimap2Aligner.cpp
     test/cpp/test_AlignBowtie2Sharded.cpp
@@ -1781,6 +1801,7 @@ set(TEST_SOURCES
     src/ena_attributes_filter.cpp
     test/cpp/test_ENAClient.cpp
     test/cpp/test_ENAResolverCache.cpp
+    test/cpp/test_ena_md5.cpp
     test/cpp/test_ena_search_field_registry.cpp
     test/cpp/test_ena_attributes_filter.cpp
     test/cpp/test_ena_attributes_pushdown.cpp
