@@ -33,6 +33,7 @@
 #include <save_bowtie2_index.hpp>
 #ifdef MIINT_HAS_MINIBWA
 #include <align_minibwa.hpp>
+#include <save_minibwa_index.hpp>
 #endif
 #include <read_ncbi_fasta.hpp>
 #include <read_ncbi.hpp>
@@ -291,6 +292,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	SaveMinimap2IndexTableFunction::Register(loader);
 #ifdef MIINT_HAS_MINIBWA
 	AlignMiniBWATableFunction::Register(loader);
+	SaveMiniBWAIndexTableFunction::Register(loader);
 #endif
 #ifdef MIINT_HAS_GPL_BOUNDARY
 	AlignBowtie2TableFunction::Register(loader);
