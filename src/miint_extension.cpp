@@ -31,6 +31,9 @@
 #include <align_minimap2_sharded.hpp>
 #include <save_minimap2_index.hpp>
 #include <save_bowtie2_index.hpp>
+#ifdef MIINT_HAS_MINIBWA
+#include <align_minibwa.hpp>
+#endif
 #include <read_ncbi_fasta.hpp>
 #include <read_ncbi.hpp>
 #include <read_ncbi_annotation.hpp>
@@ -211,6 +214,9 @@ static unique_ptr<FunctionData> MiintVersionsBind(ClientContext &context, TableF
 #ifdef MIINT_HAS_SYLPH
 	data->versions.emplace_back("sylph", SYLPH_GIT_VERSION);
 #endif
+#ifdef MIINT_HAS_MINIBWA
+	data->versions.emplace_back("minibwa", MINIBWA_GIT_VERSION);
+#endif
 #ifdef MIINT_HAS_UNIFRAC
 	data->versions.emplace_back("unifrac", UNIFRAC_GIT_VERSION);
 	data->versions.emplace_back("scikit-bio-binaries", SKBB_GIT_VERSION);
@@ -283,6 +289,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	AlignMinimap2TableFunction::Register(loader);
 	AlignMinimap2ShardedTableFunction::Register(loader);
 	SaveMinimap2IndexTableFunction::Register(loader);
+#ifdef MIINT_HAS_MINIBWA
+	AlignMiniBWATableFunction::Register(loader);
+#endif
 #ifdef MIINT_HAS_GPL_BOUNDARY
 	AlignBowtie2TableFunction::Register(loader);
 	AlignBowtie2ShardedTableFunction::Register(loader);
