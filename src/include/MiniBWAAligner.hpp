@@ -89,9 +89,13 @@ public:
 	static std::shared_ptr<SharedMiniBWAIndex> BuildSharedIndex(const std::string &index_prefix,
 	                                                            const MiniBWAConfig &config);
 
-	// Align single-end queries against the current index, appending to output.
-	// Paired-end support (mb_map_batch_pe) is a later phase; queries.sequences2
-	// is ignored here even if present.
+	// Align queries against the current index, appending to output.
+	// Dispatches on queries.is_paired: true routes the whole batch through
+	// mb_map_batch_pe() (which needs all pairs in the batch at once to
+	// estimate insert-size stats -- see map-batch-pe.c), false uses the
+	// single-end path. When is_paired is true, every row must have a
+	// non-empty sequence2 (minibwa's flat interleaved-pairs contract has no
+	// per-row opt-out, unlike minimap2's).
 	void align(const SequenceRecordBatch &queries, SAMRecordBatch &output);
 
 	static void InitOptions(const MiniBWAConfig &config, mb_opt_t &opt);
@@ -111,11 +115,16 @@ private:
 
 	void align_batch(const std::vector<std::string> &read_ids, const std::vector<std::string> &sequences,
 	                 SAMRecordBatch &output);
+	void align_paired_batch(const SequenceRecordBatch &queries, SAMRecordBatch &output);
 
-	void hit_to_sam(const mb_hit_t &hit, const std::string &read_id, int32_t query_len, SAMRecordBatch &batch) const;
+	// segment_idx: -1 for single-end, 0/1 for paired read1/read2.
+	void hit_to_sam(const mb_hit_t &hit, const std::string &read_id, int32_t query_len, SAMRecordBatch &batch,
+	                int segment_idx, bool mate_mapped, bool mate_rev, int64_t mate_tid, int64_t mate_pos,
+	                int32_t tlen) const;
 	std::string cigar_string(const mb_hit_t &hit, int32_t query_len, uint16_t sam_flags,
 	                         AlignmentStats *stats_out) const;
-	uint16_t calculate_flags(const mb_hit_t &hit, bool is_unmapped) const;
+	uint16_t calculate_flags(const mb_hit_t &hit, bool is_unmapped, int segment_idx, bool mate_mapped,
+	                         bool mate_rev) const;
 	const std::string &get_reference_name(int64_t tid) const;
 };
 

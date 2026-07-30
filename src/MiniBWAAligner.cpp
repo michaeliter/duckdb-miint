@@ -1,4 +1,5 @@
 #include "MiniBWAAligner.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -131,7 +132,11 @@ void MiniBWAAligner::align(const SequenceRecordBatch &queries, SAMRecordBatch &o
 	}
 
 	output.reserve(output.size() + queries.size());
-	align_batch(queries.read_ids, queries.sequences1, output);
+	if (queries.is_paired) {
+		align_paired_batch(queries, output);
+	} else {
+		align_batch(queries.read_ids, queries.sequences1, output);
+	}
 }
 
 void MiniBWAAligner::align_batch(const std::vector<std::string> &read_ids, const std::vector<std::string> &sequences,
@@ -169,7 +174,7 @@ void MiniBWAAligner::align_batch(const std::vector<std::string> &read_ids, const
 				}
 				secondary_count++;
 			}
-			hit_to_sam(hit, read_ids[i], qlens[i], output);
+			hit_to_sam(hit, read_ids[i], qlens[i], output, -1, false, false, -1, 0, 0);
 		}
 		for (int32_t j = 0; j < n_hit[i]; j++) {
 			free(hits[i][j].p);
@@ -179,11 +184,117 @@ void MiniBWAAligner::align_batch(const std::vector<std::string> &read_ids, const
 	free(hits);
 }
 
+void MiniBWAAligner::align_paired_batch(const SequenceRecordBatch &queries, SAMRecordBatch &output) {
+	size_t n_seq = queries.size();
+	for (size_t i = 0; i < n_seq; i++) {
+		if (queries.sequences2[i].empty()) {
+			throw std::runtime_error("MiniBWAAligner: paired-end batch has an empty sequence2 at row " +
+			                         std::to_string(i) + " (read_id=" + queries.read_ids[i] +
+			                         "); minibwa's mb_map_batch_pe requires every row to be a genuine pair");
+		}
+	}
+
+	std::vector<int32_t> qlens(2 * n_seq);
+	std::vector<const char *> seq_ptrs(2 * n_seq);
+	std::vector<const char *> name_ptrs(2 * n_seq);
+	for (size_t i = 0; i < n_seq; i++) {
+		qlens[2 * i] = static_cast<int32_t>(queries.sequences1[i].length());
+		qlens[2 * i + 1] = static_cast<int32_t>(queries.sequences2[i].length());
+		seq_ptrs[2 * i] = queries.sequences1[i].c_str();
+		seq_ptrs[2 * i + 1] = queries.sequences2[i].c_str();
+		name_ptrs[2 * i] = queries.read_ids[i].c_str();
+		name_ptrs[2 * i + 1] = queries.read_ids[i].c_str();
+	}
+
+	mb_opt_t pe_opt = active_opt();
+	pe_opt.flag |= MB_F_PE;
+
+	std::vector<int32_t> n_hit(2 * n_seq, 0);
+	mb_hit_t **hits = mb_map_batch_pe(&pe_opt, active_index(), static_cast<int32_t>(2 * n_seq), qlens.data(),
+	                                  seq_ptrs.data(), n_hit.data(), tbuf_.get(), name_ptrs.data());
+	if (!hits) {
+		return;
+	}
+
+	for (size_t p = 0; p < n_seq; p++) {
+		size_t r0 = 2 * p, r1 = 2 * p + 1;
+
+		const mb_hit_t *primary0 = nullptr;
+		const mb_hit_t *primary1 = nullptr;
+		for (int32_t j = 0; j < n_hit[r0]; j++) {
+			if (hits[r0][j].parent == hits[r0][j].id) {
+				primary0 = &hits[r0][j];
+				break;
+			}
+		}
+		for (int32_t j = 0; j < n_hit[r1]; j++) {
+			if (hits[r1][j].parent == hits[r1][j].id) {
+				primary1 = &hits[r1][j];
+				break;
+			}
+		}
+
+		bool mate_mapped0 = (primary1 != nullptr && primary1->tid >= 0);
+		bool mate_mapped1 = (primary0 != nullptr && primary0->tid >= 0);
+		bool mate_rev0 = (primary1 != nullptr) && primary1->rev;
+		bool mate_rev1 = (primary0 != nullptr) && primary0->rev;
+		int64_t mate_tid0 = mate_mapped0 ? primary1->tid : -1;
+		int64_t mate_tid1 = mate_mapped1 ? primary0->tid : -1;
+		int64_t mate_pos0 = mate_mapped0 ? (primary1->ts + 1) : 0;
+		int64_t mate_pos1 = mate_mapped1 ? (primary0->ts + 1) : 0;
+
+		int32_t tlen = 0;
+		if (primary0 && primary1 && primary0->tid >= 0 && primary0->tid == primary1->tid) {
+			int64_t leftmost = std::min(primary0->ts, primary1->ts);
+			int64_t rightmost = std::max(primary0->te, primary1->te);
+			tlen = static_cast<int32_t>(rightmost - leftmost);
+			if (primary0->ts > primary1->ts) {
+				tlen = -tlen;
+			}
+		}
+
+		int secondary_count0 = 0;
+		for (int32_t j = 0; j < n_hit[r0]; j++) {
+			const mb_hit_t &hit = hits[r0][j];
+			if (hit.parent != hit.id) {
+				if (secondary_count0 >= config_.max_secondary) {
+					continue;
+				}
+				secondary_count0++;
+			}
+			hit_to_sam(hit, queries.read_ids[p], qlens[r0], output, 0, mate_mapped0, mate_rev0, mate_tid0, mate_pos0,
+			          tlen);
+		}
+		int secondary_count1 = 0;
+		for (int32_t j = 0; j < n_hit[r1]; j++) {
+			const mb_hit_t &hit = hits[r1][j];
+			if (hit.parent != hit.id) {
+				if (secondary_count1 >= config_.max_secondary) {
+					continue;
+				}
+				secondary_count1++;
+			}
+			hit_to_sam(hit, queries.read_ids[p], qlens[r1], output, 1, mate_mapped1, mate_rev1, mate_tid1, mate_pos1,
+			          -tlen);
+		}
+	}
+
+	for (size_t i = 0; i < 2 * n_seq; i++) {
+		for (int32_t j = 0; j < n_hit[i]; j++) {
+			free(hits[i][j].p);
+		}
+		free(hits[i]);
+	}
+	free(hits);
+}
+
 void MiniBWAAligner::hit_to_sam(const mb_hit_t &hit, const std::string &read_id, int32_t query_len,
-                                SAMRecordBatch &batch) const {
+                                SAMRecordBatch &batch, int segment_idx, bool mate_mapped, bool mate_rev,
+                                int64_t mate_tid, int64_t mate_pos, int32_t tlen) const {
+	bool is_paired = (segment_idx >= 0);
 	bool is_unmapped = (hit.tid < 0);
 
-	uint16_t flags = calculate_flags(hit, is_unmapped);
+	uint16_t flags = calculate_flags(hit, is_unmapped, segment_idx, mate_mapped, mate_rev);
 	batch.read_ids.push_back(read_id);
 	batch.flags.push_back(flags);
 
@@ -202,14 +313,23 @@ void MiniBWAAligner::hit_to_sam(const mb_hit_t &hit, const std::string &read_id,
 		batch.cigars.push_back(cigar_string(hit, query_len, flags, &stats));
 	}
 
-	// Single-end only in this phase: no mate.
-	batch.mate_references.push_back("*");
-	batch.mate_positions.push_back(0);
-	batch.template_lengths.push_back(0);
+	if (is_paired && mate_mapped && mate_tid >= 0) {
+		const std::string &mate_ref = get_reference_name(mate_tid);
+		if (!is_unmapped && mate_ref == batch.references.back()) {
+			batch.mate_references.push_back("=");
+		} else {
+			batch.mate_references.push_back(mate_ref);
+		}
+		batch.mate_positions.push_back(mate_pos);
+	} else {
+		batch.mate_references.push_back("*");
+		batch.mate_positions.push_back(0);
+	}
+	batch.template_lengths.push_back(is_paired ? tlen : 0);
 
 	batch.tag_as_values.push_back(is_unmapped ? -1 : (hit.p ? hit.p->dp_score : -1));
 	batch.tag_xs_values.push_back(hit.subsc > 0 ? hit.subsc : -1);
-	batch.tag_ys_values.push_back(-1); // not applicable, single-end
+	batch.tag_ys_values.push_back(-1); // opposite-mate score not tracked by mb_hit_t
 	batch.tag_xn_values.push_back(-1); // not available from minibwa
 	batch.tag_xm_values.push_back(is_unmapped ? -1 : stats.mismatches);
 	batch.tag_xo_values.push_back(is_unmapped ? -1 : stats.gap_opens);
@@ -220,7 +340,17 @@ void MiniBWAAligner::hit_to_sam(const mb_hit_t &hit, const std::string &read_id,
 	int64_t nm = hit.blen - hit.mlen + (hit.p ? hit.p->n_ambi : 0);
 	batch.tag_nm_values.push_back(is_unmapped ? -1 : nm);
 
-	batch.tag_yt_values.push_back("UU"); // single-end only in this phase
+	std::string yt;
+	if (!is_paired) {
+		yt = "UU";
+	} else if (mate_mapped && !is_unmapped && hit.proper_pair) {
+		yt = "CP"; // concordant pair (mb_pair already decided this -- see hit.proper_pair)
+	} else if (mate_mapped && !is_unmapped) {
+		yt = "DP"; // discordant pair
+	} else {
+		yt = "UP"; // one mate unmapped
+	}
+	batch.tag_yt_values.push_back(yt);
 
 	// MD tag requires mb_write_MD(), a private function (mbpriv.h) needing
 	// direct l2b_t access this library does not expose publicly. Left NULL,
@@ -295,8 +425,24 @@ std::string MiniBWAAligner::cigar_string(const mb_hit_t &hit, int32_t query_len,
 	return result;
 }
 
-uint16_t MiniBWAAligner::calculate_flags(const mb_hit_t &hit, bool is_unmapped) const {
+uint16_t MiniBWAAligner::calculate_flags(const mb_hit_t &hit, bool is_unmapped, int segment_idx, bool mate_mapped,
+                                         bool mate_rev) const {
 	uint16_t flags = 0;
+	bool is_paired = (segment_idx >= 0);
+
+	if (is_paired) {
+		flags |= 0x1;
+		flags |= (segment_idx == 0) ? 0x40 : 0x80;
+		if (mate_mapped && !is_unmapped && hit.proper_pair) {
+			flags |= 0x2;
+		}
+		if (!mate_mapped) {
+			flags |= 0x8;
+		}
+		if (mate_rev) {
+			flags |= 0x20;
+		}
+	}
 
 	if (is_unmapped) {
 		flags |= 0x4;
