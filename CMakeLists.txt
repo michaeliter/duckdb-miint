@@ -108,6 +108,7 @@ option(MIINT_ENABLE_SORTMERNA "Build with SortMeRNA rRNA alignment support" ON)
 option(MIINT_ENABLE_SYLPH "Build with sylph FracMinHash relative-abundance profiling" ON)
 option(MIINT_ENABLE_GPL_BOUNDARY "Build with gpl-boundary subsystem (process pipes + Arrow IPC over POSIX shm)" ON)
 option(MIINT_ENABLE_UNIFRAC "Build with UniFrac (PCoA / PERMANOVA / Faith PD) support" ON)
+option(MIINT_ENABLE_MINIBWA "Build with minibwa short-read alignment support" ON)
 
 # libdeflate: Linux-only accelerator for htslib bgzf gzip (FASTQ/FASTA/BAM COPY).
 # Default ON so the shipped Linux binary actually gets the win (~3x over zlib-parallel bgzf,
@@ -206,18 +207,20 @@ if(EMSCRIPTEN)
     set(MIINT_ENABLE_SORTMERNA OFF)
     set(MIINT_ENABLE_SYLPH OFF)
     set(MIINT_ENABLE_GPL_BOUNDARY OFF)
-    message(STATUS "Emscripten detected: disabling HDF5, SortMeRNA, sylph, and gpl-boundary (WASM-incompatible)")
+    set(MIINT_ENABLE_MINIBWA OFF)
+    message(STATUS "Emscripten detected: disabling HDF5, SortMeRNA, sylph, gpl-boundary, and minibwa (WASM-incompatible)")
 elseif(WIN32)
     set(MIINT_ENABLE_MAFFT OFF)
     set(MIINT_ENABLE_ABPOA OFF)
     set(MIINT_ENABLE_SYLPH OFF)
     set(MIINT_ENABLE_GPL_BOUNDARY OFF)
     set(MIINT_ENABLE_UNIFRAC OFF)
+    set(MIINT_ENABLE_MINIBWA OFF)
     if(MINGW)
         set(MIINT_ENABLE_SORTMERNA OFF)
-        message(STATUS "MinGW detected: disabling MAFFT, SortMeRNA, sylph, gpl-boundary, and UniFrac (cmph + gpl-boundary rely on POSIX APIs; libssu inmem assumes POSIX)")
+        message(STATUS "MinGW detected: disabling MAFFT, SortMeRNA, sylph, gpl-boundary, UniFrac, and minibwa (cmph + gpl-boundary rely on POSIX APIs; libssu inmem assumes POSIX; minibwa untested on Windows)")
     else()
-        message(STATUS "Windows detected: disabling MAFFT, sylph, gpl-boundary, and UniFrac (require POSIX APIs)")
+        message(STATUS "Windows detected: disabling MAFFT, sylph, gpl-boundary, UniFrac, and minibwa (require POSIX APIs; minibwa untested on Windows)")
     endif()
 endif()
 
@@ -352,7 +355,14 @@ if(NOT SYLPH_GIT_VERSION)
     set(SYLPH_GIT_VERSION "unknown")
 endif()
 
-message(STATUS "Submodule versions: minimap2=${MINIMAP2_GIT_VERSION} WFA2=${WFA2_GIT_VERSION} rype=${RYPE_GIT_VERSION} vsearch=${VSEARCH_GIT_VERSION} mafft=${MAFFT_GIT_VERSION} abpoa=${ABPOA_GIT_VERSION} sylph=${SYLPH_GIT_VERSION} unifrac=${UNIFRAC_GIT_VERSION} skbb=${SKBB_GIT_VERSION}")
+execute_process(COMMAND git describe --tags --dirty --always
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/ext/minibwa
+    OUTPUT_VARIABLE MINIBWA_GIT_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT MINIBWA_GIT_VERSION)
+    set(MINIBWA_GIT_VERSION "unknown")
+endif()
+
+message(STATUS "Submodule versions: minimap2=${MINIMAP2_GIT_VERSION} WFA2=${WFA2_GIT_VERSION} rype=${RYPE_GIT_VERSION} vsearch=${VSEARCH_GIT_VERSION} mafft=${MAFFT_GIT_VERSION} abpoa=${ABPOA_GIT_VERSION} sylph=${SYLPH_GIT_VERSION} unifrac=${UNIFRAC_GIT_VERSION} skbb=${SKBB_GIT_VERSION} minibwa=${MINIBWA_GIT_VERSION}")
 
 # Build htslib from release tarball
 # Configure with zstd support if available (htslib autodetects via pkg-config)
@@ -604,6 +614,61 @@ set_target_properties(minimap2 PROPERTIES
     IMPORTED_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/minimap2/lib/libminimap2.a
 )
 add_dependencies(minimap2 minimap2_build)
+
+if(MIINT_ENABLE_MINIBWA)
+    # Build minibwa (MIT-licensed short-read aligner; see ext/minibwa fork's
+    # commit history for the miint-specific patches: kalloc/ksw2 symbols
+    # prefixed to avoid colliding with minimap2's copies above, mb_idx_build()
+    # for in-process index construction, mb_map_batch_pe() for data-driven
+    # paired-end insert-size estimation). gpl=0 keeps the GPLv2 low-memory BWT
+    # constructor (bwtgen.c) and its HPND-licensed QSufSort.c dependency out of
+    # the archive entirely -- libminibwa.a is MIT+Apache-2.0 (libsais) only.
+    # mimalloc=0: the mimalloc allocator override is not part of libminibwa.a
+    # regardless (see ext/minibwa/Makefile's LOBJS), but pass it explicitly so
+    # a future upstream Makefile change can't silently pull it in; an
+    # allocator override inside a host process DuckDB also allocates in is
+    # not something to risk.
+    #
+    # Cross-compilation: minibwa's own Makefile selects -msse4.2 -mpopcnt from
+    # `uname -m` (the *build host*), which is wrong when cross-compiling
+    # osx_amd64 on an arm64 runner. ARCH= on the command line overrides that
+    # (plain `=` assignment in the Makefile, not `override`), so pass the
+    # *target* arch explicitly only when cross-compiling; leave it unset for
+    # native builds where uname -m already matches the target.
+    set(MINIBWA_ARCH_CFLAGS "")
+    set(MINIBWA_ARCH_MAKEVAR "")
+    if(APPLE AND OSX_BUILD_ARCH)
+        if(OSX_BUILD_ARCH STREQUAL "arm64")
+            set(MINIBWA_ARCH_CFLAGS "-arch arm64")
+            set(MINIBWA_ARCH_MAKEVAR "ARCH=arm64")
+            message(STATUS "minibwa cross-compiling for arm64")
+        elseif(OSX_BUILD_ARCH STREQUAL "x86_64")
+            set(MINIBWA_ARCH_CFLAGS "-arch x86_64")
+            set(MINIBWA_ARCH_MAKEVAR "ARCH=x86_64")
+            message(STATUS "minibwa cross-compiling for x86_64 on Apple Silicon")
+        endif()
+    endif()
+
+    ExternalProject_Add(
+        minibwa_build
+        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ext/minibwa
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND make -C ${CMAKE_CURRENT_SOURCE_DIR}/ext/minibwa clean
+            COMMAND make -C ${CMAKE_CURRENT_SOURCE_DIR}/ext/minibwa libminibwa.a gpl=0 mimalloc=0
+                "CFLAGS=-std=c99 -g -Wall -O3 -fPIC ${MINIBWA_ARCH_CFLAGS} -I${ZLIB_INCLUDE_DIRS}" ${MINIBWA_ARCH_MAKEVAR}
+        INSTALL_COMMAND ${CMAKE_COMMAND} -E copy
+            ${CMAKE_CURRENT_SOURCE_DIR}/ext/minibwa/libminibwa.a
+            ${CMAKE_CURRENT_BINARY_DIR}/minibwa/lib/libminibwa.a
+        BUILD_IN_SOURCE 1
+        BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/minibwa/lib/libminibwa.a
+    )
+
+    add_library(minibwa STATIC IMPORTED GLOBAL)
+    set_target_properties(minibwa PROPERTIES
+        IMPORTED_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/minibwa/lib/libminibwa.a
+    )
+    add_dependencies(minibwa minibwa_build)
+endif()
 
 # Handle cross-compilation arch flags for WFA2
 set(WFA2_ARCH_CFLAGS "")
@@ -1478,6 +1543,10 @@ if(MIINT_ENABLE_SYLPH)
     target_compile_definitions(${EXTENSION_NAME} PRIVATE MIINT_HAS_SYLPH
         SYLPH_GIT_VERSION="${SYLPH_GIT_VERSION}")
 endif()
+if(MIINT_ENABLE_MINIBWA)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE MIINT_HAS_MINIBWA
+        MINIBWA_GIT_VERSION="${MINIBWA_GIT_VERSION}")
+endif()
 if(MIINT_ENABLE_CURL)
     target_compile_definitions(${EXTENSION_NAME} PRIVATE MIINT_HAS_CURL)
 endif()
@@ -1515,6 +1584,9 @@ if(MIINT_ENABLE_VSEARCH)
 endif()
 if(MIINT_ENABLE_SORTMERNA)
     target_link_libraries(${EXTENSION_NAME} sortmerna RocksDB::rocksdb)
+endif()
+if(MIINT_ENABLE_MINIBWA)
+    target_link_libraries(${EXTENSION_NAME} minibwa)
 endif()
 # MIINT_ENABLE_SYLPH: sylph's symbols ship inside libmiint_rust_glue.a alongside
 # rype's, so the existing `rype` link above already provides them. No separate
@@ -1617,6 +1689,10 @@ if(MIINT_ENABLE_SYLPH)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MIINT_HAS_SYLPH
         SYLPH_GIT_VERSION="${SYLPH_GIT_VERSION}")
 endif()
+if(MIINT_ENABLE_MINIBWA)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MIINT_HAS_MINIBWA
+        MINIBWA_GIT_VERSION="${MINIBWA_GIT_VERSION}")
+endif()
 if(MIINT_ENABLE_CURL)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MIINT_HAS_CURL)
 endif()
@@ -1654,6 +1730,9 @@ if(MIINT_ENABLE_VSEARCH)
 endif()
 if(MIINT_ENABLE_SORTMERNA)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} sortmerna RocksDB::rocksdb)
+endif()
+if(MIINT_ENABLE_MINIBWA)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} minibwa)
 endif()
 # sylph's symbols come in via rype's archive — see comment in EXTENSION_NAME
 # block above.
@@ -1935,6 +2014,10 @@ if(MIINT_ENABLE_SYLPH)
     # symbols — see comment near the rype IMPORTED target declaration.
     target_link_libraries(tests rype)
     target_compile_definitions(tests PRIVATE MIINT_HAS_SYLPH)
+endif()
+if(MIINT_ENABLE_MINIBWA)
+    target_link_libraries(tests minibwa)
+    target_compile_definitions(tests PRIVATE MIINT_HAS_MINIBWA)
 endif()
 if(MIINT_ENABLE_GPL_BOUNDARY)
     target_sources(tests PRIVATE $<TARGET_OBJECTS:miint_nanoarrow_ipc>)
