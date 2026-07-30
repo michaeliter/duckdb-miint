@@ -44,3 +44,7 @@
 	path = ext/sylph
 	url = https://github.com/the-miint/sylph.git
 	branch = v0.9.0-miint
+[submodule "ext/minibwa"]
+	path = ext/minibwa
+	url = https://github.com/michaeliter/minibwa.git
+	branch = v0.5-miint
