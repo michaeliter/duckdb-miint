@@ -1931,6 +1931,9 @@ endif()
 if(MIINT_ENABLE_ABPOA)
     list(APPEND TEST_SOURCES src/AbpoaAligner.cpp test/cpp/test_AbpoaAligner.cpp)
 endif()
+if(MIINT_ENABLE_MINIBWA)
+    list(APPEND TEST_SOURCES src/MiniBWAAligner.cpp test/cpp/test_MiniBWAAligner.cpp)
+endif()
 if(MIINT_ENABLE_SORTMERNA)
     list(APPEND TEST_SOURCES
         src/SortMeRNAAligner.cpp
