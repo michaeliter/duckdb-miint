@@ -193,11 +193,24 @@ TEST_CASE("MiniBWAAligner paired-end alignment reports proper pair", "[MiniBWAAl
 
 	std::string mate1 = ref.substr(30, 50);
 	std::string mate2_fwd = ref.substr(200, 50);
-	std::string comp = "";
-	static const char comp_map[256] = {['A'] = 'T', ['C'] = 'G', ['G'] = 'C', ['T'] = 'A'};
 	std::string mate2(mate2_fwd.rbegin(), mate2_fwd.rend());
 	for (auto &c : mate2) {
-		c = comp_map[static_cast<unsigned char>(c)];
+		switch (c) {
+		case 'A':
+			c = 'T';
+			break;
+		case 'C':
+			c = 'G';
+			break;
+		case 'G':
+			c = 'C';
+			break;
+		case 'T':
+			c = 'A';
+			break;
+		default:
+			break;
+		}
 	}
 
 	auto query = make_paired_query_batch("pair1", mate1, mate2);
