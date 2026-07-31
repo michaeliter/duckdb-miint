@@ -744,36 +744,45 @@ SELECT * FROM save_minibwa_index('shard_b_refs', 'indexes/shard_b');
 
 #### Single index alignment with minibwa
 
-Align query sequences to subject sequences using minibwa. Currently supports pre-built indexes only (`index_path`) — unlike `align_minimap2`, there is no `subject_table` on-the-fly mode or `per_subject_database` mode yet; build an index with `save_minibwa_index` first.
+Align query sequences to subject sequences using minibwa. Supports both `subject_table` (build a combined index on-the-fly) and `index_path` (load a pre-built index) — **exactly one of the two is required**, same contract as `align_minimap2`. There is no `per_subject_database` mode (see Limitations).
 
 **Parameters:**
 - `query_table` (VARCHAR): Name of table or view containing query sequences. Must have `read_fastx`-compatible schema (read_id, sequence1, optional sequence2/qual1/qual2). The `read_id` column may be `VARCHAR`, `BIGINT`, or `UUID`.
-- `index_path` (VARCHAR, required): Path prefix to a pre-built minibwa index (written by `save_minibwa_index`; expects `<index_path>.l2b` and `<index_path>.mbw`).
+- `subject_table` (VARCHAR, optional): Name of table or view containing subject/reference sequences. Must have `read_fastx`-compatible schema. Cannot contain paired-end data (sequence2 must be NULL or absent). **Either `subject_table` or `index_path` must be provided, but not both.**
+- `index_path` (VARCHAR, optional): Path prefix to a pre-built minibwa index (written by `save_minibwa_index`; expects `<index_path>.l2b` and `<index_path>.mbw`). **Either `subject_table` or `index_path` must be provided, but not both.**
 - `preset` (VARCHAR, default: `'sr'`): minibwa preset.
   - `'sr'`: short reads
   - `'adap'`: adaptive short/long mixed mode (minibwa's own CLI default via `mb_opt_init`)
   - `'lr'`: long reads
 - `max_secondary` (INTEGER, default: 0): Maximum secondary alignments actually **emitted**. This maps to minibwa's `--outn` (output cap), not `-N`/`best_n` (internal candidate retention for chaining/mapq, which stays fixed at the preset's own value — 50 for `sr`/`adap` — regardless of this parameter). **The default of 0 intentionally does not match `align_minimap2`'s default of 5** — it matches `minibwa map`'s own CLI default (emit zero secondaries), confirmed by diffing `align_minibwa`'s output against the real CLI. A secondary is only emitted if its score is at least 80% of its primary's (minibwa's fixed `out_s` threshold).
+- `sa_bit` (INTEGER, default: 4): Suffix-array sample-rate exponent, only relevant with `subject_table` (same meaning as `save_minibwa_index`'s `sa_bit`). **Warning:** Ignored when using `index_path` (the SA sample rate is baked into the pre-built index).
 
 **Output schema:**
 Returns the same schema as `read_alignments` (21 columns) — see [Single index alignment with minimap2](#single-index-alignment-with-minimap2) for the full column list. Two columns are always NULL for minibwa: `tag_md` (MD-tag generation needs a private minibwa function this extension does not call — same treatment `align_bowtie2` gives `tag_sa`) and `tag_xn`/`tag_ys` (not tracked by minibwa's hit records).
 
-**Identifier-column types:** Same contract as `align_minimap2` — `read_id` may be `VARCHAR`, `BIGINT`, or `UUID` and mirrors through to the output; `reference`/`mate_reference` are always `VARCHAR` (minibwa index files store subject names as opaque bytes, like minimap2's `.mmi`).
+**Identifier-column types:** `read_id` may be `VARCHAR`, `BIGINT`, or `UUID` and mirrors through to the output. `reference`/`mate_reference` are always `VARCHAR` **regardless of mode**, including `subject_table` — this differs from `align_minimap2`, whose `subject_table` mode preserves the subject's original id type. minibwa's index builder only accepts a FASTA file path (`mb_idx_build`, unlike minimap2's in-memory `mm_idx_str`), so even the on-the-fly path stages subjects through a temp FASTA and reads the contig names back from the built index — a `BIGINT` subject `read_id` comes back as its decimal string form (e.g. `'2001'`), the same as if you'd built the index with `save_minibwa_index` first.
 
 **Behavior:**
+- `subject_table` mode: subjects are read once at bind time, staged to a temporary FASTA, and built into one combined index via `mb_idx_build` at execution start (not per-query) — mirrors `align_minimap2`'s default (non-`per_subject_database`) `subject_table` behavior: one index, built once, all queries aligned against it. The temp FASTA and temp index files are removed immediately after the index is loaded into memory (minibwa's loader reads the whole index onto the heap, not mmap, so the on-disk copy isn't needed afterward).
 - Supports both single-end and paired-end query sequences. Paired-end is auto-detected from the query table's schema (a `sequence2` column with at least one non-NULL/non-empty value in the batch) — no explicit `paired` parameter needed, matching `align_minimap2`'s auto-detection rather than `align_bowtie2`'s explicit flag.
 - Paired-end alignment estimates the insert-size distribution from the batch itself once at least 20 pairs are available (minibwa's own `mb_pestat` heuristic); smaller batches use a predefined fallback (mean 400bp, std 100bp — minibwa's own defaults). `tag_yt` reports `CP`/`DP`/`UP` accordingly.
 - Query sequences are processed in batches for memory efficiency
-- Verified byte-for-byte identical to the native `minibwa map` CLI on real data (single-end and paired-end) — see `test/sql/align_minibwa_ground_truth.test` and `test/sql/align_minibwa_paired_ground_truth.test`.
+- Verified byte-for-byte identical to the native `minibwa map` CLI on real data (single-end and paired-end) — see `test/sql/align_minibwa_ground_truth.test` and `test/sql/align_minibwa_paired_ground_truth.test`. `subject_table` mode is verified to produce output identical to the equivalent `index_path` mode (same staging + `mb_idx_build` code path either way).
 
 **Examples:**
 ```sql
 CREATE TABLE subjects AS SELECT * FROM read_fastx('references.fasta');
 CREATE TABLE queries AS SELECT * FROM read_fastx('reads.fastq');
 
+-- Basic alignment using subject_table (builds index on-the-fly)
+SELECT read_id, reference, position, mapq, cigar
+FROM align_minibwa('queries', subject_table := 'subjects')
+ORDER BY read_id;
+
+-- === Using a pre-built index (recommended for repeated queries against the same reference) ===
+
 SELECT * FROM save_minibwa_index('subjects', 'references_minibwa');
 
--- Primary alignments only
 SELECT read_id, reference, position, mapq, cigar
 FROM align_minibwa('queries', index_path := 'references_minibwa')
 ORDER BY read_id;
@@ -796,14 +805,16 @@ WHERE mapq >= 30;
 
 **Error handling:**
 - Error if `query_table` does not exist
-- Error if `index_path` is not provided
+- Error if neither `subject_table` nor `index_path` is provided
+- Error if both `subject_table` and `index_path` are provided
 - Error if `<index_path>.l2b` or `<index_path>.mbw` does not exist
+- Error if `subject_table` contains paired-end data (sequence2 not NULL) or is empty
 - Error if `preset` is unknown to minibwa
+- Error if `sa_bit <= 0`
 - Error if a paired-end batch contains a mix of paired and unpaired rows (minibwa's flat interleaved-pairs contract has no per-row opt-out the way minimap2's per-row dispatch does — a batch must be either entirely paired or entirely unpaired)
 
 **Limitations:**
-- No `subject_table` on-the-fly indexing mode yet — build an index with `save_minibwa_index` first
-- No `per_subject_database` mode
+- No `per_subject_database` mode: `align_minimap2` can rebuild its index once per subject (cheap — `mm_idx_str()` is pure in-memory) to align every query against each subject independently rather than competitively against one combined index. minibwa has no in-memory index-build path, so the equivalent would mean a temp-FASTA + suffix-array build *per subject* rather than per query set — meaningfully more expensive than minimap2's version for anything beyond a handful of subjects. Not implemented; if you need per-reference-independent alignment stats against a reference panel, build separate indexes with `save_minibwa_index` and call `align_minibwa` once per reference.
 - `tag_md` is always NULL
 
 #### Sharded alignment with minibwa

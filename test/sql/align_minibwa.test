@@ -25,7 +25,12 @@ CREATE TABLE mb_queries AS SELECT * FROM (VALUES
 statement error
 SELECT * FROM align_minibwa('mb_queries');
 ----
-requires index_path
+requires either subject_table or index_path parameter
+
+statement error
+SELECT * FROM align_minibwa('mb_queries', subject_table := 'mb_subjects', index_path := 'no_such_minibwa_index');
+----
+Cannot specify both subject_table and index_path
 
 statement error
 SELECT * FROM align_minibwa('mb_queries', index_path := 'no_such_minibwa_index');
@@ -36,6 +41,14 @@ statement error
 SELECT * FROM align_minibwa('nonexistent_table', index_path := 'no_such_minibwa_index');
 ----
 does not exist
+
+statement ok
+CREATE TABLE mb_subjects_empty AS SELECT * FROM (VALUES ('x', 'ACGT')) AS t(read_id, sequence1) WHERE false;
+
+statement error
+SELECT * FROM align_minibwa('mb_queries', subject_table := 'mb_subjects_empty');
+----
+is empty
 
 # ==============================================================================
 # BUILD INDEX, THEN CORRECTNESS TESTS
@@ -119,3 +132,52 @@ query I
 SELECT count(*) FROM align_minibwa('mb_queries_general_schema', index_path := 'align_minibwa_test_idx', max_secondary := 0);
 ----
 2
+
+# ==============================================================================
+# subject_table MODE (build index on-the-fly, no save_minibwa_index step)
+# ==============================================================================
+
+# Must produce results identical to the pre-built index_path path above --
+# mb_idx_build() always round-trips through a temp FASTA (see the class
+# comment on align_minibwa.hpp's Data), so the two modes should be
+# indistinguishable in output.
+query III
+SELECT read_id, reference, mapq >= 0 AS has_mapq
+FROM align_minibwa('mb_queries', subject_table := 'mb_subjects', max_secondary := 0)
+ORDER BY read_id, reference;
+----
+query1	ref1	true
+query2	ref2	true
+
+query II
+SELECT read_id, cigar
+FROM align_minibwa('mb_queries', subject_table := 'mb_subjects', max_secondary := 0)
+ORDER BY read_id;
+----
+query1	52M
+query2	52M
+
+# subject_table mode's `reference` is VARCHAR even when the subject table's
+# read_id is BIGINT -- the on-disk index round-trip stringifies it (see the
+# class comment on align_minibwa.hpp's Data for why, unlike align_minimap2).
+statement ok
+CREATE TABLE mb_subjects_bigint AS SELECT * FROM (VALUES
+    (100::BIGINT, 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCC')
+) AS t(read_id, sequence1);
+
+query II
+SELECT read_id, reference
+FROM align_minibwa('mb_queries', subject_table := 'mb_subjects_bigint', max_secondary := 0)
+ORDER BY read_id;
+----
+query1	100
+
+# sa_bit is accepted for subject_table mode and warned-but-accepted for
+# index_path mode (warning goes to stderr, not asserted here).
+statement ok
+SELECT * FROM align_minibwa('mb_queries', subject_table := 'mb_subjects', sa_bit := 2, max_secondary := 0);
+
+statement error
+SELECT * FROM align_minibwa('mb_queries', subject_table := 'mb_subjects', sa_bit := 0);
+----
+sa_bit must be > 0

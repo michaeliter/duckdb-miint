@@ -8,11 +8,9 @@
 
 namespace duckdb {
 
-namespace {
-
 // Same mkdtemp/$TMPDIR convention as align_bowtie2::MakeTempIndexDir, staging
 // a FASTA for mb_idx_build() rather than an index output directory.
-std::string MakeTempDir(const char *caller) {
+std::string MakeMiniBWATempDir(const char *caller) {
 	const char *tmp = std::getenv("TMPDIR");
 	if (!tmp || !*tmp) {
 		tmp = "/tmp";
@@ -26,25 +24,23 @@ std::string MakeTempDir(const char *caller) {
 	return std::string(buf.data());
 }
 
-void WriteSubjectsFasta(const std::string &path, const std::vector<miint::AlignmentSubject> &subjects,
-                        const std::string &subject_table) {
+void WriteMiniBWASubjectsFasta(const std::string &path, const std::vector<miint::AlignmentSubject> &subjects,
+                               const std::string &subject_table, const char *caller) {
 	std::ofstream out(path, std::ios::binary);
 	if (!out) {
-		throw IOException("save_minibwa_index: failed to open temp FASTA for writing: %s", path);
+		throw IOException("%s: failed to open temp FASTA for writing: %s", caller, path);
 	}
 	for (const auto &subject : subjects) {
 		if (subject.sequence.empty()) {
-			throw InvalidInputException("save_minibwa_index: subject '%s' in table '%s' has an empty sequence",
+			throw InvalidInputException("%s: subject '%s' in table '%s' has an empty sequence", caller,
 			                            subject.read_id, subject_table);
 		}
 		out << '>' << subject.read_id << '\n' << subject.sequence << '\n';
 	}
 	if (!out) {
-		throw IOException("save_minibwa_index: write error while staging temp FASTA: %s", path);
+		throw IOException("%s: write error while staging temp FASTA: %s", caller, path);
 	}
 }
-
-} // namespace
 
 unique_ptr<FunctionData> SaveMiniBWAIndexTableFunction::Bind(ClientContext &context, TableFunctionBindInput &input,
                                                              vector<LogicalType> &return_types,
@@ -88,11 +84,11 @@ unique_ptr<GlobalTableFunctionState> SaveMiniBWAIndexTableFunction::InitGlobal(C
 	auto &data = input.bind_data->Cast<Data>();
 	auto gstate = make_uniq<GlobalState>();
 
-	std::string temp_dir = MakeTempDir("save_minibwa_index");
+	std::string temp_dir = MakeMiniBWATempDir("save_minibwa_index");
 	std::string fasta_path = temp_dir + "/subjects.fa";
 
 	try {
-		WriteSubjectsFasta(fasta_path, data.subjects, data.subject_table);
+		WriteMiniBWASubjectsFasta(fasta_path, data.subjects, data.subject_table, "save_minibwa_index");
 
 		int rc = mb_idx_build(fasta_path.c_str(), data.output_path.c_str(), data.config.sa_bit, /*n_thread=*/1,
 		                      /*is_meth=*/0, /*seed=*/11);

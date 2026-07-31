@@ -3,6 +3,7 @@
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/vector_size.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include <filesystem>
 
 namespace duckdb {
 
@@ -31,25 +32,65 @@ unique_ptr<FunctionData> AlignMiniBWATableFunction::Bind(ClientContext &context,
 	}
 	data->query_table = input.inputs[0].ToString();
 
+	auto subject_param = input.named_parameters.find("subject_table");
+	if (subject_param != input.named_parameters.end() && !subject_param->second.IsNull()) {
+		data->subject_table = subject_param->second.ToString();
+	}
+
 	auto index_path_param = input.named_parameters.find("index_path");
 	if (index_path_param != input.named_parameters.end() && !index_path_param->second.IsNull()) {
 		data->index_path = index_path_param->second.ToString();
 	}
-	if (data->index_path.empty()) {
-		throw BinderException("align_minibwa requires index_path (build one with save_minibwa_index)");
+
+	bool has_subject = !data->subject_table.empty();
+	bool has_index = data->using_prebuilt_index();
+	if (!has_subject && !has_index) {
+		throw BinderException("align_minibwa requires either subject_table or index_path parameter");
+	}
+	if (has_subject && has_index) {
+		throw BinderException(
+		    "align_minibwa: Cannot specify both subject_table and index_path. "
+		    "Use subject_table to build an index from sequences, or index_path to load a pre-built index.");
 	}
 
 	data->query_schema = ValidateSequenceTableSchema(context, data->query_table, /*allow_bigint=*/true);
 
 	ParseMiniBWAConfigParams(input.named_parameters, data->config);
 
-	// Advisory existence check (TOCTOU, like align_minimap2's is_index_file
-	// check) -- minibwa has no single-file magic-number probe like
-	// mm_idx_is_idx; the index is a pair of files.
-	auto &fs = FileSystem::GetFileSystem(context);
-	if (!fs.FileExists(data->index_path + ".l2b") || !fs.FileExists(data->index_path + ".mbw")) {
-		throw BinderException("minibwa index not found at prefix: %s (expected %s.l2b and %s.mbw)", data->index_path,
-		                      data->index_path, data->index_path);
+	auto sa_bit_param = input.named_parameters.find("sa_bit");
+	if (sa_bit_param != input.named_parameters.end() && !sa_bit_param->second.IsNull()) {
+		data->config.sa_bit = sa_bit_param->second.GetValue<int32_t>();
+		if (data->config.sa_bit <= 0) {
+			throw InvalidInputException("sa_bit must be > 0");
+		}
+		if (has_index) {
+			Printer::Print("WARNING: Parameter 'sa_bit' is ignored when using a pre-built index. "
+			               "The SA sample rate is baked into the index.\n");
+		}
+	}
+
+	if (has_index) {
+		// Advisory existence check (TOCTOU, like align_minimap2's is_index_file
+		// check) -- minibwa has no single-file magic-number probe like
+		// mm_idx_is_idx; the index is a pair of files.
+		auto &fs = FileSystem::GetFileSystem(context);
+		if (!fs.FileExists(data->index_path + ".l2b") || !fs.FileExists(data->index_path + ".mbw")) {
+			throw BinderException("minibwa index not found at prefix: %s (expected %s.l2b and %s.mbw)",
+			                      data->index_path, data->index_path, data->index_path);
+		}
+	} else {
+		// subject_table mode: load subjects now (matches align_minimap2's
+		// pattern -- subjects are read once at bind time). The actual index
+		// build (staging a temp FASTA, calling mb_idx_build) happens in
+		// InitGlobal, same split as save_minibwa_index's Bind/InitGlobal.
+		auto subject_schema = ValidateSequenceTableSchema(context, data->subject_table, /*allow_bigint=*/true);
+		data->subjects = ReadSubjectTable(context, data->subject_table, subject_schema);
+		if (data->subjects.empty()) {
+			throw BinderException("Subject table '%s' is empty. Cannot align against an empty subject set.",
+			                      data->subject_table);
+		}
+		// subject_id_type stays VARCHAR regardless of subject_schema.id_type --
+		// see the class comment on Data for why minibwa can't preserve it.
 	}
 
 	data->types = GetAlignmentOutputTypes(data->query_schema.id_type, data->subject_id_type);
@@ -69,11 +110,42 @@ unique_ptr<GlobalTableFunctionState> AlignMiniBWATableFunction::InitGlobal(Clien
 	auto &data = input.bind_data->Cast<Data>();
 	auto gstate = make_uniq<GlobalState>();
 
-	try {
-		gstate->shared_index = miint::MiniBWAAligner::BuildSharedIndex(data.index_path, data.config);
-	} catch (const std::exception &e) {
-		throw IOException("Failed to load minibwa index from '%s': %s", data.index_path, e.what());
+	if (data.using_prebuilt_index()) {
+		try {
+			gstate->shared_index = miint::MiniBWAAligner::BuildSharedIndex(data.index_path, data.config);
+		} catch (const std::exception &e) {
+			throw IOException("Failed to load minibwa index from '%s': %s", data.index_path, e.what());
+		}
+	} else {
+		// Build a combined index from all subjects, staged through one temp
+		// FASTA -- mb_idx_build() only accepts a file path (see the class
+		// comment on Data). Mirrors align_minimap2's default (non-
+		// per_subject_database) subject_table path: one index, built once,
+		// all queries aligned against it.
+		std::string temp_dir = MakeMiniBWATempDir("align_minibwa");
+		std::string fasta_path = temp_dir + "/subjects.fa";
+		std::string index_prefix = temp_dir + "/idx";
+		try {
+			WriteMiniBWASubjectsFasta(fasta_path, data.subjects, data.subject_table, "align_minibwa");
+			int rc = mb_idx_build(fasta_path.c_str(), index_prefix.c_str(), data.config.sa_bit, /*n_thread=*/1,
+			                      /*is_meth=*/0, /*seed=*/11);
+			if (rc != 0) {
+				throw IOException("align_minibwa: mb_idx_build failed (rc=%d) for staged FASTA: %s", rc, fasta_path);
+			}
+			gstate->shared_index = miint::MiniBWAAligner::BuildSharedIndex(index_prefix, data.config);
+		} catch (...) {
+			std::error_code ec;
+			std::filesystem::remove_all(temp_dir, ec); // best-effort; can't propagate ec from an exception path
+			throw;
+		}
+		// mb_idx_load() reads the whole index into heap memory (not mmap), so
+		// once BuildSharedIndex has returned, the on-disk files are no longer
+		// needed -- safe to remove immediately, unlike e.g. a daemon-backed
+		// index that needs its files to persist for the session.
+		std::error_code ec;
+		std::filesystem::remove_all(temp_dir, ec);
 	}
+
 	gstate->num_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 	gstate->query_stream = std::make_unique<QuerySequenceStream>(context, data.query_table, data.query_schema);
 
@@ -124,9 +196,11 @@ void AlignMiniBWATableFunction::Execute(ClientContext &context, TableFunctionInp
 TableFunction AlignMiniBWATableFunction::GetFunction() {
 	auto tf = TableFunction("align_minibwa", {LogicalType::VARCHAR}, Execute, Bind, InitGlobal, InitLocal);
 
+	tf.named_parameters["subject_table"] = LogicalType::VARCHAR;
 	tf.named_parameters["index_path"] = LogicalType::VARCHAR;
 	tf.named_parameters["preset"] = LogicalType::VARCHAR;
 	tf.named_parameters["max_secondary"] = LogicalType::INTEGER;
+	tf.named_parameters["sa_bit"] = LogicalType::INTEGER;
 
 	// Alignment output order is non-deterministic (thread scheduling), so
 	// NO_ORDER lets DuckDB parallelize CTAS pipelines instead of serializing
