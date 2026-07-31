@@ -47,4 +47,4 @@
 [submodule "ext/minibwa"]
 	path = ext/minibwa
 	url = https://github.com/michaeliter/minibwa.git
-	branch = v0.5-miint
+	branch = v0.6-miint
