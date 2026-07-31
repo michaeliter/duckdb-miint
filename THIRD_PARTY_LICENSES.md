@@ -138,6 +138,87 @@ SOFTWARE.
 
 ---
 
+## minibwa
+
+Short-read alignment. Used by `align_minibwa`, `align_minibwa_sharded`, and
+`save_minibwa_index`. Vendored as a miint fork (`the-miint`/`michaeliter`
+branch `v0.5-miint`) carrying four patches on top of upstream: kalloc/ksw2
+symbols prefixed to avoid colliding with minimap2's copies of the same code
+(both descend from the same klib/ksw2 lineage), an in-process index-build
+entry point, data-driven paired-end insert-size estimation, and a defensive
+NULL check in the allocator's OOM path. None of the patches change licensing.
+
+- Repository: https://github.com/lh3/minibwa
+- License: MIT
+
+### Citation
+
+Li H. "Minibwa" (successor to bwa-mem, combining BWT/FM-index seeding with
+minimap2's chaining and ksw2 SIMD alignment). See the upstream repository for
+the current citation.
+
+### MIT License
+
+Copyright (c) 2025-     Dana-Farber Cancer Institute
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+### libsais (bundled, Apache License 2.0)
+
+minibwa's index construction (`mb_idx_build`) uses libsais for suffix-array
+construction. Bundled in the same vendored source tree and compiled into the
+same static archive as the rest of minibwa.
+
+- Repository: https://github.com/IlyaGrebnov/libsais
+- License: Apache License 2.0
+- Copyright (c) 2021-2025 Ilya Grebnov \<ilya.grebnov@gmail.com\>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+### GPL and HPND code present but never compiled
+
+Upstream minibwa's low-memory BWT construction path (`bwtgen.c`, GPLv2-or-later,
+Copyright (C) 2004 Wong Chi Kwong) and its HPND-licensed dependency
+(`QSufSort.c`/`QSufSort.h`, Copyright 1999 N. Jesper Larsson) are present in
+the vendored source tree — upstream ships them as an opt-out CLI feature
+(`minibwa index -l`) — but are **not compiled**: the build passes `gpl=0`,
+which excludes both files from every build target in this extension,
+including `libminibwa.a`. `mb_idx_build()` (the entry point this extension
+actually calls) always takes the default libsais-based suffix-array path;
+the GPL/HPND code is unreachable from any code path in miint. `mimalloc`
+(bundled, MIT-licensed) is similarly present but not compiled — the build
+passes `mimalloc=0`, and the extension uses DuckDB's own allocator instead.
+
+---
+
 ## WFA2-lib
 
 Pairwise sequence alignment using the Wavefront Alignment Algorithm (WFA).
