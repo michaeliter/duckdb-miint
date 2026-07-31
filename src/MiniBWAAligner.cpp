@@ -41,7 +41,11 @@ void MiniBWAAligner::InitOptions(const MiniBWAConfig &config, mb_opt_t &opt) {
 	// by default (see ext/minibwa/options.c). Paired-end support is a later
 	// phase (mb_map_batch_pe).
 	opt.flag &= ~MB_F_PE;
-	opt.best_n = config.max_secondary;
+	// best_n (internal retention) intentionally left at the preset's own
+	// value -- see the MiniBWAConfig comment on why this must not be
+	// max_secondary.
+	opt.out_n = config.max_secondary;
+	opt.out_s = config.secondary_score_ratio;
 }
 
 std::vector<std::string> MiniBWAAligner::EnumerateContigNames(const mb_idx_t *idx) {
@@ -163,18 +167,31 @@ void MiniBWAAligner::align_batch(const std::vector<std::string> &read_ids, const
 		return;
 	}
 
+	const mb_opt_t &opt = active_opt();
 	for (size_t i = 0; i < sequences.size(); i++) {
-		int secondary_count = 0;
+		int32_t n_sec = 0; // count of secondaries emitted so far for this read
 		for (int32_t j = 0; j < n_hit[i]; j++) {
 			const mb_hit_t &hit = hits[i][j];
 			bool is_primary = (hit.parent == hit.id);
+			// Exact gate from map-main.c: primary always passes; a secondary
+			// only if there's still room in the output budget (opt.out_n).
+			if (!(is_primary || n_sec < opt.out_n)) {
+				continue;
+			}
 			if (!is_primary) {
-				if (secondary_count >= config_.max_secondary) {
+				const mb_hit_t &parent = hits[i][hit.parent];
+				if (parent.p && hit.p) {
+					if (hit.p->dp_max < opt.out_s * parent.p->dp_max) {
+						continue;
+					}
+				} else if (hit.score < opt.out_s * parent.score) {
 					continue;
 				}
-				secondary_count++;
 			}
 			hit_to_sam(hit, read_ids[i], qlens[i], output, -1, false, false, -1, 0, 0);
+			if (!is_primary) {
+				n_sec++;
+			}
 		}
 		for (int32_t j = 0; j < n_hit[i]; j++) {
 			free(hits[i][j].p);
@@ -253,29 +270,55 @@ void MiniBWAAligner::align_paired_batch(const SequenceRecordBatch &queries, SAMR
 			}
 		}
 
-		int secondary_count0 = 0;
+		// Same output gate + score-ratio filter as align_batch's single-end
+		// path (see the comment there), applied independently per mate --
+		// matches map-main.c, which also resets n_sec per segment, not per
+		// fragment.
+		int32_t n_sec0 = 0;
 		for (int32_t j = 0; j < n_hit[r0]; j++) {
 			const mb_hit_t &hit = hits[r0][j];
-			if (hit.parent != hit.id) {
-				if (secondary_count0 >= config_.max_secondary) {
+			bool is_primary = (hit.parent == hit.id);
+			if (!(is_primary || n_sec0 < pe_opt.out_n)) {
+				continue;
+			}
+			if (!is_primary) {
+				const mb_hit_t &parent = hits[r0][hit.parent];
+				if (parent.p && hit.p) {
+					if (hit.p->dp_max < pe_opt.out_s * parent.p->dp_max) {
+						continue;
+					}
+				} else if (hit.score < pe_opt.out_s * parent.score) {
 					continue;
 				}
-				secondary_count0++;
 			}
 			hit_to_sam(hit, queries.read_ids[p], qlens[r0], output, 0, mate_mapped0, mate_rev0, mate_tid0, mate_pos0,
 			          tlen);
+			if (!is_primary) {
+				n_sec0++;
+			}
 		}
-		int secondary_count1 = 0;
+		int32_t n_sec1 = 0;
 		for (int32_t j = 0; j < n_hit[r1]; j++) {
 			const mb_hit_t &hit = hits[r1][j];
-			if (hit.parent != hit.id) {
-				if (secondary_count1 >= config_.max_secondary) {
+			bool is_primary = (hit.parent == hit.id);
+			if (!(is_primary || n_sec1 < pe_opt.out_n)) {
+				continue;
+			}
+			if (!is_primary) {
+				const mb_hit_t &parent = hits[r1][hit.parent];
+				if (parent.p && hit.p) {
+					if (hit.p->dp_max < pe_opt.out_s * parent.p->dp_max) {
+						continue;
+					}
+				} else if (hit.score < pe_opt.out_s * parent.score) {
 					continue;
 				}
-				secondary_count1++;
 			}
 			hit_to_sam(hit, queries.read_ids[p], qlens[r1], output, 1, mate_mapped1, mate_rev1, mate_tid1, mate_pos1,
 			          -tlen);
+			if (!is_primary) {
+				n_sec1++;
+			}
 		}
 	}
 

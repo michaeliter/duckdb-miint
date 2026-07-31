@@ -14,12 +14,22 @@ namespace miint {
 // Configuration for minibwa alignment. Presets mirror the CLI's own:
 // "sr"/"adap" (short/adaptive read, MB_F_PE on by default upstream -- cleared
 // explicitly here since this phase is single-end only) and "lr" (long read).
-// max_secondary maps to mb_opt_t::best_n; minibwa's own sr/adap default (50)
-// is intentionally kept rather than matching minimap2's lower default (5) --
-// see options.c's mb_opt_preset().
+//
+// minibwa has TWO separate secondary-alignment controls, easy to conflate
+// (an earlier version of this wrapper did): mb_opt_t::best_n (-N, default 50
+// via the sr/adap preset) caps how many candidate secondaries are internally
+// *retained* for chaining/mapq purposes, while mb_opt_t::out_n (--outn,
+// default 0) caps how many actually get *emitted*. This wrapper leaves
+// best_n at whatever the preset sets (never overridden by config) and maps
+// max_secondary to out_n only -- so the CLI's own default (emit zero
+// secondaries) is what you get unless you ask for more. This intentionally
+// does not match minimap2Config's default of 5; it matches minibwa's own
+// CLI default instead, verified by parity-diffing against `minibwa map`.
 struct MiniBWAConfig {
 	std::string preset = "sr";
-	int max_secondary = 50;
+	int max_secondary = 0;               // -> opt.out_n (secondaries actually emitted)
+	float secondary_score_ratio = 0.8f;  // -> opt.out_s: emit a secondary only if its
+	                                     // score >= this fraction of its primary's score
 	bool is_meth = false; // BS-seq mode; plumbed for a future phase, not wired into align_minibwa yet
 	int sa_bit = 4;       // SA sample-rate exponent for index building (CLI default)
 };
