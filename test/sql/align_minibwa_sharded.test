@@ -1,0 +1,124 @@
+# name: test/sql/align_minibwa_sharded.test
+# description: Test align_minibwa_sharded table function
+# group: [sql]
+
+require miint
+
+# SET threads=1 by default within a statement block below where multi-thread
+# behavior isn't being exercised; the routing/threading test explicitly
+# raises it.
+
+# Two distinct ~200bp synthetic subjects, one per shard. Indexes are built
+# at test-run time (not checked in -- minibwa's two-file index is far larger
+# than minimap2's .mmi for equivalent content, so small synthetic subjects
+# built on demand keep this fixture-free, matching the .mmi ground-truth
+# tests' preference for real data only where it's small, like
+# data/shards/shard_{a,b}.mmi).
+statement ok
+CREATE TABLE shard_a_subject AS SELECT * FROM (VALUES
+    ('contig_a', 'TTCGATCGGATCCTAGCATGCTAGCTAGCATCGATGCTAGCTGACTGATCGTAGCTAGCATCGATCGATCGTAGCTAGCTAGCATGCATCGATCGTAGCTAGCATCGATGCTAGCATCGATGCATCGATGCTAGCGGGCTATCGATCGATCGATGCATGCATGCATGCATCGATGCTAGCTAGCTAGCATCGATGCTAGC')
+) AS t(read_id, sequence1);
+
+statement ok
+CREATE TABLE shard_b_subject AS SELECT * FROM (VALUES
+    ('contig_b', 'GGGATCCAAGCTTGAATTCGAGCTCGGTACCCGGGGATCCTCTAGAGTCGACCTGCAGGCATGCAAGCTTGGCACTGGCCGTCGTTTTACAACGTCGTGACTGGGAAAACCCTGGCGTTACCCAACTTAATCGCCTTGCAGCACATCCCCCTTTCGCCAGCTGGCGTAATAGCGAAGAGGCCCGCACCGATCGCCCTTC')
+) AS t(read_id, sequence1);
+
+statement ok
+CREATE TABLE queries AS SELECT * FROM (VALUES
+    ('query1', 'TTCGATCGGATCCTAGCATGCTAGCTAGCATCGATGCTAGCTGACTGATC'),
+    ('query2', 'GGGATCCAAGCTTGAATTCGAGCTCGGTACCCGGGGATCCTCTAGAGTCG'),
+    ('query3', 'GATCCTCTAGAGTCGACCTGCAGGCATGCAAGCTTGGCACTGGCCGTCGT')
+) AS t(read_id, sequence1);
+
+statement ok
+CREATE TABLE read_to_shard AS SELECT * FROM (VALUES
+    ('query1', 'shard_a'),
+    ('query2', 'shard_b'),
+    ('query3', 'shard_b')
+) AS t(read_id, shard_name);
+
+# ==============================================================================
+# ERROR HANDLING TESTS (Fail Fast)
+# ==============================================================================
+
+statement error
+SELECT * FROM align_minibwa_sharded('queries', read_to_shard := 'read_to_shard');
+----
+requires shard_directory parameter
+
+statement error
+SELECT * FROM align_minibwa_sharded('queries', shard_directory := 'data/shards_minibwa/');
+----
+requires read_to_shard parameter
+
+statement error
+SELECT * FROM align_minibwa_sharded('nonexistent_table', shard_directory := 'data/shards_minibwa/', read_to_shard := 'read_to_shard');
+----
+does not exist
+
+statement error
+SELECT * FROM align_minibwa_sharded('queries', shard_directory := 'data/does_not_exist_dir/', read_to_shard := 'read_to_shard');
+----
+Shard directory does not exist
+
+# ==============================================================================
+# BUILD SHARD INDEXES, THEN ROUTING/ALIGNMENT TESTS
+# ==============================================================================
+
+statement ok
+SELECT * FROM save_minibwa_index('shard_a_subject', 'shard_minibwa_a');
+
+statement ok
+SELECT * FROM save_minibwa_index('shard_b_subject', 'shard_minibwa_b');
+
+# Missing shard index files
+statement error
+SELECT * FROM align_minibwa_sharded('queries', shard_directory := '.', read_to_shard := 'read_to_shard');
+----
+Shard index files do not exist
+
+statement ok
+CREATE TABLE shard_dir_marker AS SELECT 1;
+
+# Route to a directory containing shard_minibwa_a/.l2b+.mbw and shard_minibwa_b/.l2b+.mbw
+# by pointing shard_directory at '.' with shard names matching the prefixes
+# written above (shard_minibwa_a / shard_minibwa_b).
+statement ok
+CREATE TABLE read_to_shard2 AS SELECT * FROM (VALUES
+    ('query1', 'shard_minibwa_a'),
+    ('query2', 'shard_minibwa_b'),
+    ('query3', 'shard_minibwa_b')
+) AS t(read_id, shard_name);
+
+query I
+SELECT count(*) FROM align_minibwa_sharded('queries', shard_directory := '.', read_to_shard := 'read_to_shard2', preset := 'sr');
+----
+3
+
+query ITTIT
+SELECT read_id, reference, cigar, mapq, shard_name
+FROM align_minibwa_sharded('queries', shard_directory := '.', read_to_shard := 'read_to_shard2', preset := 'sr', include_shard_name := true)
+ORDER BY read_id;
+----
+query1	contig_a	50M	60	shard_minibwa_a
+query2	contig_b	50M	60	shard_minibwa_b
+query3	contig_b	50M	60	shard_minibwa_b
+
+# Same query set, multi-threaded: results must be identical regardless of
+# thread count (this is what the cooperative ClaimWork/ReleaseWork scheduler
+# exists to guarantee).
+statement ok
+SET threads=4;
+
+query ITTIT
+SELECT read_id, reference, cigar, mapq, shard_name
+FROM align_minibwa_sharded('queries', shard_directory := '.', read_to_shard := 'read_to_shard2', preset := 'sr', include_shard_name := true)
+ORDER BY read_id;
+----
+query1	contig_a	50M	60	shard_minibwa_a
+query2	contig_b	50M	60	shard_minibwa_b
+query3	contig_b	50M	60	shard_minibwa_b
+
+statement ok
+SET threads=1;
