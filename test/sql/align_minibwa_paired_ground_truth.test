@@ -1,0 +1,59 @@
+# name: test/sql/align_minibwa_paired_ground_truth.test
+# description: Verify align_minibwa paired-end output matches native minibwa (0.5-r414) field-by-field
+# group: [sql]
+
+# Ground truth generated with:
+#   minibwa index data/minimap2/subject.fasta /tmp/idx
+#   minibwa map -x sr /tmp/idx data/minibwa/pe_queries_R1.fq data/minibwa/pe_queries_R2.fq
+#   minibwa version: 0.5-r414 (ext/minibwa fork, commit 829c2a6)
+# Test data:
+#   data/minibwa/pe_queries_R{1,2}.fq - 6 synthetic 150bp read pairs, 300-500bp
+#   FR inserts, sampled from real coordinates in data/minimap2/subject.fasta
+#   (NC_000913.3, E. coli K-12 MG1655). pe_pair_2's mate1 carries one injected
+#   mismatch to exercise NM/AS != the perfect-match values.
+# All 6 pairs map uniquely as concordant pairs (mapq=60, tag_yt=CP), exercising
+# mb_map_batch_pe's mb_pestat data-driven insert-size path is NOT triggered
+# here (only 6 pairs, below the >=20 threshold -- see mb_map_batch_pe's own
+# doc comment) -- this test is intentionally about mate bookkeeping
+# (mate_reference/mate_position/template_length/flags/tag_yt) using the
+# predefined-stats fallback path, not insert-size estimation.
+
+require miint
+
+statement ok
+CREATE TABLE pe_subject AS SELECT * FROM read_fastx('data/minimap2/subject.fasta');
+
+statement ok
+CREATE TABLE pe_queries AS
+    SELECT read_id, sequence1, sequence2
+    FROM read_fastx('data/minibwa/pe_queries_R1.fq', sequence2 := 'data/minibwa/pe_queries_R2.fq');
+
+statement ok
+SELECT * FROM save_minibwa_index('pe_subject', 'minibwa_paired_ground_truth_idx');
+
+# 6 pairs -> 12 mapped mates, all unique concordant pairs
+query I
+SELECT count(*) FROM align_minibwa('pe_queries', index_path:='minibwa_paired_ground_truth_idx', preset:='sr');
+----
+12
+
+query IIIIIITTIIIIIIIIIITT
+SELECT read_id, flags, reference, position, stop_position, mapq, cigar,
+       mate_reference, mate_position, template_length,
+       tag_as, tag_xs, tag_ys, tag_xn, tag_xm, tag_xo, tag_xg, tag_nm,
+       tag_yt, tag_md
+FROM align_minibwa('pe_queries', index_path:='minibwa_paired_ground_truth_idx', preset:='sr')
+ORDER BY read_id, (flags & 64) DESC;
+----
+pe_pair_0	99	NC_000913.3	1266415	1266565	60	150M	=	1266647	382	300	NULL	NULL	NULL	0	0	0	0	CP	NULL
+pe_pair_0	147	NC_000913.3	1266647	1266797	60	150M	=	1266415	-382	300	NULL	NULL	NULL	0	0	0	0	CP	NULL
+pe_pair_1	99	NC_000913.3	406056	406206	60	150M	=	406307	401	300	NULL	NULL	NULL	0	0	0	0	CP	NULL
+pe_pair_1	147	NC_000913.3	406307	406457	60	150M	=	406056	-401	300	NULL	NULL	NULL	0	0	0	0	CP	NULL
+pe_pair_2	99	NC_000913.3	4496305	4496455	60	150M	=	4496473	318	290	NULL	NULL	NULL	0	0	0	1	CP	NULL
+pe_pair_2	147	NC_000913.3	4496473	4496623	60	150M	=	4496305	-318	300	NULL	NULL	NULL	0	0	0	0	CP	NULL
+pe_pair_3	99	NC_000913.3	487531	487681	60	150M	=	487774	393	300	NULL	NULL	NULL	0	0	0	0	CP	NULL
+pe_pair_3	147	NC_000913.3	487774	487924	60	150M	=	487531	-393	300	NULL	NULL	NULL	0	0	0	0	CP	NULL
+pe_pair_4	99	NC_000913.3	1802019	1802169	60	150M	=	1802298	429	300	NULL	NULL	NULL	0	0	0	0	CP	NULL
+pe_pair_4	147	NC_000913.3	1802298	1802448	60	150M	=	1802019	-429	300	NULL	NULL	NULL	0	0	0	0	CP	NULL
+pe_pair_5	99	NC_000913.3	721978	722128	60	150M	=	722137	309	300	NULL	NULL	NULL	0	0	0	0	CP	NULL
+pe_pair_5	147	NC_000913.3	722137	722287	60	150M	=	721978	-309	300	NULL	NULL	NULL	0	0	0	0	CP	NULL

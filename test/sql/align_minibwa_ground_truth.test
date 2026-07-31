@@ -1,0 +1,49 @@
+# name: test/sql/align_minibwa_ground_truth.test
+# description: Verify align_minibwa output matches native minibwa (0.5-r414) field-by-field
+# group: [sql]
+
+# Ground truth generated with:
+#   minibwa index data/minimap2/subject.fasta /tmp/idx
+#   minibwa map -x sr /tmp/idx data/minimap2/queries.fasta
+#   minibwa version: 0.5-r414 (ext/minibwa fork, commit 829c2a6)
+# Test data (shared with align_minimap2_ground_truth.test):
+#   data/minimap2/queries.fasta - 5 HiFi reads extracted from PERF-CHECK dataset
+#   data/minimap2/subject.fasta - NC_000913.3 (E. coli K-12 MG1655, 4641652 bp)
+# All 5 reads produce primary alignments with mapq=60, no secondaries. Mix of
+# forward/reverse strand and perfect/imperfect matches (NM=0 and NM=1).
+
+require miint
+
+statement ok
+CREATE TABLE subject AS SELECT * FROM read_fastx('data/minimap2/subject.fasta');
+
+statement ok
+CREATE TABLE queries AS SELECT * FROM read_fastx('data/minimap2/queries.fasta');
+
+statement ok
+SELECT * FROM save_minibwa_index('subject', 'minibwa_ground_truth_idx');
+
+# Verify correct number of alignments (5 queries, all mapped, no secondaries)
+query I
+SELECT count(*) FROM align_minibwa('queries', index_path:='minibwa_ground_truth_idx', preset:='sr');
+----
+5
+
+# Verify all fields match native minibwa 0.5-r414 output
+# Columns: read_id, flags, reference, position, stop_position, mapq, cigar,
+#           mate_reference, mate_position, template_length,
+#           tag_as, tag_xs, tag_ys, tag_xn, tag_xm, tag_xo, tag_xg, tag_nm,
+#           tag_yt, tag_md
+query IIIIIITTIIIIIIIIIITT
+SELECT read_id, flags, reference, position, stop_position, mapq, cigar,
+       mate_reference, mate_position, template_length,
+       tag_as, tag_xs, tag_ys, tag_xn, tag_xm, tag_xo, tag_xg, tag_nm,
+       tag_yt, tag_md
+FROM align_minibwa('queries', index_path:='minibwa_ground_truth_idx', preset:='sr')
+ORDER BY read_id, position;
+----
+m84137_260130_125423_s3/135594187/ccs	16	NC_000913.3	3338111	3339866	60	1755M14S	*	0	0	3510	NULL	NULL	NULL	0	0	0	0	UU	NULL
+m84137_260130_125423_s3/18156364/ccs	0	NC_000913.3	4177174	4178821	60	1647M	*	0	0	3284	NULL	NULL	NULL	0	0	0	1	UU	NULL
+m84137_260130_125423_s3/219548324/ccs	0	NC_000913.3	1012833	1015181	60	14S2348M	*	0	0	4696	NULL	NULL	NULL	0	0	0	0	UU	NULL
+m84137_260130_125423_s3/234685748/ccs	16	NC_000913.3	2938461	2940752	60	2291M9S	*	0	0	4582	NULL	NULL	NULL	0	0	0	0	UU	NULL
+m84137_260130_125423_s3/63641322/ccs	16	NC_000913.3	3445575	3448277	60	2702M	*	0	0	5394	NULL	NULL	NULL	0	0	0	1	UU	NULL

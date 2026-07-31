@@ -136,8 +136,29 @@ void MiniBWAAligner::align(const SequenceRecordBatch &queries, SAMRecordBatch &o
 	}
 
 	output.reserve(output.size() + queries.size());
+
 	if (queries.is_paired) {
-		align_paired_batch(queries, output);
+		// The query table's schema having a sequence2 column (e.g.
+		// read_fastx()'s general schema always includes one) doesn't mean
+		// this batch is actually paired data -- single-end input read via
+		// read_fastx() with no mate file leaves sequence2 NULL/empty for
+		// every row. Fall back to single-end for an all-empty batch, same
+		// as Minimap2Aligner's per-row graceful degradation; a genuine mix
+		// of paired and unpaired rows in one batch still throws in
+		// align_paired_batch, since minibwa's flat-interleaved-pairs
+		// contract has no per-row opt-out the way minimap2's does.
+		bool any_paired = false;
+		for (const auto &s2 : queries.sequences2) {
+			if (!s2.empty()) {
+				any_paired = true;
+				break;
+			}
+		}
+		if (any_paired) {
+			align_paired_batch(queries, output);
+		} else {
+			align_batch(queries.read_ids, queries.sequences1, output);
+		}
 	} else {
 		align_batch(queries.read_ids, queries.sequences1, output);
 	}
