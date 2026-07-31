@@ -17,6 +17,11 @@
 
 namespace duckdb {
 
+// Shared with align_minibwa_sharded.cpp. Unlike ParseMinimap2ConfigParams
+// (align_common.hpp), there's no warn_prebuilt_index case -- MiniBWAConfig
+// has no analogue of minimap2's k/w baked-into-the-index parameters.
+void ParseMiniBWAConfigParams(const named_parameter_map_t &params, miint::MiniBWAConfig &config);
+
 // index_path only in this phase (pre-built index, loaded via mb_idx_load).
 // subject_table (build-on-the-fly) is deferred to pair with
 // save_minibwa_index, since both need the same "stage to temp FASTA, call

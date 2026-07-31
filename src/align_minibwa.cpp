@@ -6,7 +6,7 @@
 
 namespace duckdb {
 
-static void ParseMiniBWAConfigParams(const named_parameter_map_t &params, miint::MiniBWAConfig &config) {
+void ParseMiniBWAConfigParams(const named_parameter_map_t &params, miint::MiniBWAConfig &config) {
 	auto preset_param = params.find("preset");
 	if (preset_param != params.end() && !preset_param->second.IsNull()) {
 		config.preset = preset_param->second.ToString();
