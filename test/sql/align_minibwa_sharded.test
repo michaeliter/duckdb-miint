@@ -4,6 +4,8 @@
 
 require miint
 
+require-env MINIBWA_AVAILABLE
+
 # SET threads=1 by default within a statement block below where multi-thread
 # behavior isn't being exercised; the routing/threading test explicitly
 # raises it.

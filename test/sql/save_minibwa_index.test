@@ -1,0 +1,87 @@
+# name: test/sql/save_minibwa_index.test
+# description: Test save_minibwa_index table function
+# group: [sql]
+
+require miint
+
+require-env MINIBWA_AVAILABLE
+
+statement ok
+CREATE TABLE smi_subjects AS SELECT * FROM (VALUES
+    ('ref1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCC'),
+    ('ref2', 'TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCAAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAA')
+) AS t(read_id, sequence1);
+
+query ITI
+SELECT * FROM save_minibwa_index('smi_subjects', 'save_minibwa_index_test');
+----
+true	save_minibwa_index_test	2
+
+statement error
+SELECT * FROM save_minibwa_index('nonexistent_table', 'save_minibwa_index_test2');
+----
+does not exist
+
+statement ok
+CREATE TABLE smi_empty AS SELECT * FROM (VALUES ('x', 'ACGT')) AS t(read_id, sequence1) WHERE false;
+
+statement error
+SELECT * FROM save_minibwa_index('smi_empty', 'save_minibwa_index_empty');
+----
+is empty
+
+statement ok
+CREATE TABLE smi_empty_seq AS SELECT * FROM (VALUES ('ref1', '')) AS t(read_id, sequence1);
+
+statement error
+SELECT * FROM save_minibwa_index('smi_empty_seq', 'save_minibwa_index_emptyseq');
+----
+empty sequence
+
+statement ok
+CREATE TABLE smi_paired AS SELECT * FROM (VALUES ('ref1', 'ACGT', 'TGCA')) AS t(read_id, sequence1, sequence2);
+
+statement error
+SELECT * FROM save_minibwa_index('smi_paired', 'save_minibwa_index_paired');
+----
+cannot be paired-end
+
+# sa_bit validation
+statement error
+SELECT * FROM save_minibwa_index('smi_subjects', 'save_minibwa_index_sabit', sa_bit := 0);
+----
+sa_bit must be > 0
+
+statement ok
+SELECT * FROM save_minibwa_index('smi_subjects', 'save_minibwa_index_sabit2', sa_bit := 2);
+
+# The index just built is loadable and produces correct alignments
+statement ok
+CREATE TABLE smi_queries AS SELECT * FROM (VALUES
+    ('query1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT')
+) AS t(read_id, sequence1);
+
+query II
+SELECT read_id, reference
+FROM align_minibwa('smi_queries', index_path := 'save_minibwa_index_test', max_secondary := 0);
+----
+query1	ref1
+
+# BIGINT subject read_id: index round-trips through a stringified FASTA
+# header, so the recovered `reference` is VARCHAR (documented -- opaque
+# bytes in the index, same as minimap2's .mmi).
+statement ok
+CREATE TABLE smi_subjects_bigint AS SELECT * FROM (VALUES
+    (100::BIGINT, 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCC')
+) AS t(read_id, sequence1);
+
+query ITI
+SELECT * FROM save_minibwa_index('smi_subjects_bigint', 'save_minibwa_index_bigint');
+----
+true	save_minibwa_index_bigint	1
+
+query II
+SELECT read_id, reference
+FROM align_minibwa('smi_queries', index_path := 'save_minibwa_index_bigint', max_secondary := 0);
+----
+query1	100

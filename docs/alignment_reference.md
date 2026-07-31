@@ -12,6 +12,10 @@ MIINT exposes a variety of methods for high throughput alignment. In general, MI
   - [Index creation](#index-creation-with-minimap2) - Creating an index for use later.
   - [Single index alignment](#single-index-alignment-with-minimap2) - Aligning to a single index.
   - [Sharded alignment](#sharded-alignment-with-minimap2) - Aligning to many indices.
+- [minibwa](#minibwa) - Short-read alignment with minibwa.
+  - [Index creation](#index-creation-with-minibwa) - Creating an index for use later.
+  - [Single index alignment](#single-index-alignment-with-minibwa) - Aligning to a single index.
+  - [Sharded alignment](#sharded-alignment-with-minibwa) - Aligning to many indices.
 - [SortMeRNA](#sortmerna) - Read alignment with SortMeRNA.
   - [Alignment with SAM output] - Alignment with SAM output like minimap2 and bowtie2.
   - [Alignment with rRNA output] - Aligning with the native rRNA output.
@@ -692,6 +696,181 @@ SELECT * FROM align_minimap2_sharded('nanopore_reads',
 - Shards are sorted by read count (largest first) for better load balancing
 - Pre-built indexes avoid redundant index building across runs
 - `k` and `w` parameters are ignored (baked into the pre-built index); a warning is printed if specified
+
+### minibwa
+
+MIINT embeds [minibwa](https://github.com/lh3/minibwa) (Heng Li; successor to bwa-mem, combining BWT/FM-index seeding with minimap2's chaining and ksw2 SIMD alignment) as a statically linked library. Unlike bowtie2, minibwa is MIT-licensed and requires no GPL boundary daemon or separate install step — `align_minibwa` works out of the box wherever the extension is loaded.
+
+#### Index creation with minibwa
+
+Build and save a minibwa index to disk for reuse. This is the minibwa analogue of `save_minimap2_index`.
+
+**Use case:** Build per-shard minibwa indexes once, then align many query sets against them with `align_minibwa_sharded`. `align_minibwa_sharded` expects each shard's index at `<shard_directory>/<shard_name>.l2b` and `<shard_directory>/<shard_name>.mbw`, so build each shard with `output_path = '<shard_directory>/<shard_name>'`.
+
+**Parameters:**
+- `subject_table` (VARCHAR): Name of table or view containing subject/reference sequences. Must have `read_fastx`-compatible schema. Cannot contain paired-end data (sequence2 must be NULL or absent). The `read_id` column may be `VARCHAR`, `BIGINT`, or `UUID`; non-VARCHAR ids are stringified before being written into the index (recovered subject names are always `VARCHAR`, same contract as minimap2).
+- `output_path` (VARCHAR): Basename **prefix** for the index. minibwa writes two files (`<output_path>.l2b`, `<output_path>.mbw`) — different from `save_minimap2_index`'s single `.mmi` file, and lighter-weight than bowtie2's six `.bt2` files. The parent directory is created if it does not exist.
+- `sa_bit` (INTEGER, default: 4): Suffix-array sample-rate exponent (samples every `1<<sa_bit` positions). Matches the `minibwa index -u` CLI default; lower values trade index size for lookup speed.
+
+**Output schema:**
+- `success` (BOOLEAN): Always true if function completes successfully
+- `index_path` (VARCHAR): The `output_path` prefix the index files were written under
+- `num_subjects` (BIGINT): Number of subject sequences indexed
+
+**Behavior:**
+- Loads all subject sequences from the table
+- Stages them to a temporary FASTA file (minibwa's index builder only accepts a file path, unlike minimap2's in-memory `mm_idx_str`), builds the index via the libsais suffix-array path (equivalent to `minibwa index`, never the GPL-licensed low-memory `-l` path — no GPL code is reachable from this extension), and removes the temp file afterward regardless of success or failure
+- Writes the two index files to `output_path`
+- Returns a single row with success status and metadata
+
+**Known limitation:** because index construction round-trips subjects through an on-disk FASTA (kseq-parsed, the same convention `minibwa index` itself uses), a `read_id` containing whitespace is truncated at the first space when read back as the index's contig name — kseq treats everything after the first space as a comment, not part of the name. This is consistent (the truncated name is what `align_minibwa`'s `reference` column will also show), but it differs from `subject_table`'s original `read_id` in that edge case. minimap2 does not have this problem, since `save_minimap2_index` builds directly from in-memory sequences.
+
+**Examples:**
+```sql
+CREATE TABLE refs AS SELECT * FROM read_fastx('references.fasta');
+
+-- Build an index
+SELECT * FROM save_minibwa_index('refs', 'references_minibwa');
+-- Returns: true | references_minibwa | 10575
+
+-- Use the saved index for alignment
+CREATE TABLE reads AS SELECT * FROM read_fastx('reads.fastq');
+SELECT * FROM align_minibwa('reads', index_path := 'references_minibwa', max_secondary := 0);
+
+-- Build per-shard indexes for align_minibwa_sharded
+SELECT * FROM save_minibwa_index('shard_a_refs', 'indexes/shard_a');
+SELECT * FROM save_minibwa_index('shard_b_refs', 'indexes/shard_b');
+```
+
+#### Single index alignment with minibwa
+
+Align query sequences to subject sequences using minibwa. Currently supports pre-built indexes only (`index_path`) — unlike `align_minimap2`, there is no `subject_table` on-the-fly mode or `per_subject_database` mode yet; build an index with `save_minibwa_index` first.
+
+**Parameters:**
+- `query_table` (VARCHAR): Name of table or view containing query sequences. Must have `read_fastx`-compatible schema (read_id, sequence1, optional sequence2/qual1/qual2). The `read_id` column may be `VARCHAR`, `BIGINT`, or `UUID`.
+- `index_path` (VARCHAR, required): Path prefix to a pre-built minibwa index (written by `save_minibwa_index`; expects `<index_path>.l2b` and `<index_path>.mbw`).
+- `preset` (VARCHAR, default: `'sr'`): minibwa preset.
+  - `'sr'`: short reads
+  - `'adap'`: adaptive short/long mixed mode (minibwa's own CLI default via `mb_opt_init`)
+  - `'lr'`: long reads
+- `max_secondary` (INTEGER, default: 0): Maximum secondary alignments actually **emitted**. This maps to minibwa's `--outn` (output cap), not `-N`/`best_n` (internal candidate retention for chaining/mapq, which stays fixed at the preset's own value — 50 for `sr`/`adap` — regardless of this parameter). **The default of 0 intentionally does not match `align_minimap2`'s default of 5** — it matches `minibwa map`'s own CLI default (emit zero secondaries), confirmed by diffing `align_minibwa`'s output against the real CLI. A secondary is only emitted if its score is at least 80% of its primary's (minibwa's fixed `out_s` threshold).
+
+**Output schema:**
+Returns the same schema as `read_alignments` (21 columns) — see [Single index alignment with minimap2](#single-index-alignment-with-minimap2) for the full column list. Two columns are always NULL for minibwa: `tag_md` (MD-tag generation needs a private minibwa function this extension does not call — same treatment `align_bowtie2` gives `tag_sa`) and `tag_xn`/`tag_ys` (not tracked by minibwa's hit records).
+
+**Identifier-column types:** Same contract as `align_minimap2` — `read_id` may be `VARCHAR`, `BIGINT`, or `UUID` and mirrors through to the output; `reference`/`mate_reference` are always `VARCHAR` (minibwa index files store subject names as opaque bytes, like minimap2's `.mmi`).
+
+**Behavior:**
+- Supports both single-end and paired-end query sequences. Paired-end is auto-detected from the query table's schema (a `sequence2` column with at least one non-NULL/non-empty value in the batch) — no explicit `paired` parameter needed, matching `align_minimap2`'s auto-detection rather than `align_bowtie2`'s explicit flag.
+- Paired-end alignment estimates the insert-size distribution from the batch itself once at least 20 pairs are available (minibwa's own `mb_pestat` heuristic); smaller batches use a predefined fallback (mean 400bp, std 100bp — minibwa's own defaults). `tag_yt` reports `CP`/`DP`/`UP` accordingly.
+- Query sequences are processed in batches for memory efficiency
+- Verified byte-for-byte identical to the native `minibwa map` CLI on real data (single-end and paired-end) — see `test/sql/align_minibwa_ground_truth.test` and `test/sql/align_minibwa_paired_ground_truth.test`.
+
+**Examples:**
+```sql
+CREATE TABLE subjects AS SELECT * FROM read_fastx('references.fasta');
+CREATE TABLE queries AS SELECT * FROM read_fastx('reads.fastq');
+
+SELECT * FROM save_minibwa_index('subjects', 'references_minibwa');
+
+-- Primary alignments only
+SELECT read_id, reference, position, mapq, cigar
+FROM align_minibwa('queries', index_path := 'references_minibwa')
+ORDER BY read_id;
+
+-- With secondary alignments
+SELECT * FROM align_minibwa('queries', index_path := 'references_minibwa', max_secondary := 5);
+
+-- Long-read preset
+SELECT * FROM align_minibwa('long_reads', index_path := 'references_minibwa', preset := 'lr');
+
+-- Paired-end alignment (sequence2 auto-detected)
+CREATE TABLE paired_queries AS SELECT * FROM read_fastx('R1.fastq', sequence2 := 'R2.fastq');
+SELECT * FROM align_minibwa('paired_queries', index_path := 'references_minibwa');
+
+-- Filter by mapping quality and identity
+SELECT read_id, reference, position, alignment_seq_identity(cigar, tag_nm, tag_md) AS identity
+FROM align_minibwa('queries', index_path := 'references_minibwa')
+WHERE mapq >= 30;
+```
+
+**Error handling:**
+- Error if `query_table` does not exist
+- Error if `index_path` is not provided
+- Error if `<index_path>.l2b` or `<index_path>.mbw` does not exist
+- Error if `preset` is unknown to minibwa
+- Error if a paired-end batch contains a mix of paired and unpaired rows (minibwa's flat interleaved-pairs contract has no per-row opt-out the way minimap2's per-row dispatch does — a batch must be either entirely paired or entirely unpaired)
+
+**Limitations:**
+- No `subject_table` on-the-fly indexing mode yet — build an index with `save_minibwa_index` first
+- No `per_subject_database` mode
+- `tag_md` is always NULL
+
+#### Sharded alignment with minibwa
+
+Align query sequences against multiple pre-built minibwa index shards in parallel, following the same reference-sharding-with-pre-routed-reads model as `align_minimap2_sharded` (one shared in-process index per shard, multiple threads cooperatively working each shard) rather than `align_bowtie2_sharded`'s one-shard-per-worker-daemon model.
+
+**Parameters:**
+- `query_table` (VARCHAR): Same as `align_minibwa`.
+- `shard_directory` (VARCHAR, required): Path to directory containing pre-built minibwa index files. Each shard's index is expected at `<shard_directory>/<shard_name>.l2b` and `<shard_directory>/<shard_name>.mbw`.
+- `read_to_shard` (VARCHAR, required): Name of table or view mapping reads to shards. Same schema as `align_minimap2_sharded`'s `read_to_shard`: `read_id` (must match `query_table.read_id`'s type exactly) and `shard_name` (VARCHAR).
+- `preset` (VARCHAR, default: `'sr'`): Same as `align_minibwa`.
+- `max_secondary` (INTEGER, default: 0): Same as `align_minibwa` — maps to `out_n`, not `best_n`.
+- `max_threads_per_shard` (INTEGER, default: 4, range 1-64): Maximum DuckDB worker threads that may cooperatively work a single shard at once.
+- `include_shard_name` (BOOLEAN, default: false): Append a `shard_name` output column.
+- `progress` (BOOLEAN, default: false): Opt-in per-shard progress lines to stderr, same format as `align_minimap2_sharded`.
+
+**Output schema:**
+Returns the same 21-column schema as `align_minibwa` and `read_alignments`, plus `shard_name` when `include_shard_name := true`.
+
+**Behavior:**
+- At bind time, reads `read_to_shard` to discover shards and validates that both index files exist for each shard
+- Threads cooperatively claim shards: join an existing active shard with spare capacity, or start a new one (up to `ceil(SET threads / max_threads_per_shard)` concurrently active shards, relaxed for small shards so all threads stay busy) — the same scheduler as `align_minimap2_sharded`, just retargeted at `MiniBWAAligner`/`SharedMiniBWAIndex`
+- A read can appear in multiple shards (mapped to multiple `shard_name` rows) and is aligned against each independently
+- Unmapped reads (flag 0x4) are automatically filtered out of results
+- Supports both single-end and paired-end query sequences
+
+**Limitation — no cross-shard best-hit selection:** each shard is aligned completely independently, with no visibility into any other shard's candidates. If a read has a genuinely competing match (e.g. a duplicated or highly similar region) that happens to live in a *different* shard than the one the read is routed to, that shard cannot know the competitor exists — it reports the hit with the same confidence (`mapq`) it would if the shard held the only copy of that sequence in the world. Routing the same read to *multiple* shards does not fix this either: each shard independently reports its own confident hit, producing the union of two "unique" alignments rather than one correctly-flagged ambiguous pair.
+
+This was verified directly: an exact-duplicate 300bp region split across two shards produces `mapq=0` on both copies when aligned against a *single unified* index containing both shards' sequences (correctly reflecting the ambiguity), but `mapq=60` when each copy is aligned against its own shard in isolation — whether routed to one shard or both. This is not unique to minibwa; `align_bowtie2_sharded` and `align_minimap2_sharded` have the identical limitation, since none of the sharded functions in this extension merge or reconcile per-shard results (by design — see `align_common.hpp`'s `ReadShardNameCounts`/`ValidateReadToShardSchema`, shared across all three). Sharded `mapq` is only comparable to unsharded `mapq` when shard boundaries don't split cross-shard-ambiguous sequence; if that matters for your reference database, keep near-duplicate/repetitive sequence within a single shard, or treat sharded `mapq` as a per-shard-local confidence score rather than a global one.
+
+**Examples:**
+```sql
+-- Setup: pre-build shard indexes
+SELECT * FROM save_minibwa_index('shard_a_refs', 'indexes/shard_a');
+SELECT * FROM save_minibwa_index('shard_b_refs', 'indexes/shard_b');
+
+CREATE TABLE queries AS SELECT * FROM read_fastx('reads.fastq');
+CREATE TABLE read_to_shard AS SELECT * FROM (VALUES
+    ('read1', 'shard_a'),
+    ('read2', 'shard_b'),
+    ('read3', 'shard_a')
+) AS t(read_id, shard_name);
+
+SELECT * FROM align_minibwa_sharded('queries',
+    shard_directory := 'indexes/',
+    read_to_shard := 'read_to_shard',
+    max_secondary := 0);
+
+-- With shard attribution
+SELECT read_id, reference, position, mapq, shard_name
+FROM align_minibwa_sharded('queries',
+    shard_directory := 'indexes/',
+    read_to_shard := 'read_to_shard',
+    include_shard_name := true);
+```
+
+**Error handling:**
+- Error if `shard_directory` does not exist
+- Error if `<shard_name>.l2b` or `<shard_name>.mbw` referenced in `read_to_shard` does not exist in `shard_directory`
+- Error if `query_table` or `read_to_shard` table/view does not exist
+- Error if `read_to_shard` table is missing `read_id` or `shard_name` columns
+- Error if `read_to_shard` table contains NULL `shard_name` values
+
+**Performance notes:**
+- Parallelism is `SET threads=N` cooperative threads shared across shards (`max_threads_per_shard` bounds how many work one shard at once); control total concurrency with `SET threads`
+- Shards are sorted by read count (largest first) for better load balancing
+- Index loading and read-ID materialization happen outside the scheduler lock, so one slow shard load doesn't block other threads from claiming other shards
 
 ### SortMeRNA
 

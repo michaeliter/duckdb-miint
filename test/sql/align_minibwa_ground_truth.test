@@ -14,6 +14,8 @@
 
 require miint
 
+require-env MINIBWA_AVAILABLE
+
 statement ok
 CREATE TABLE subject AS SELECT * FROM read_fastx('data/minimap2/subject.fasta');
 

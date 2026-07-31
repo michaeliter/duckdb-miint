@@ -1,0 +1,121 @@
+# name: test/sql/align_minibwa.test
+# description: Test align_minibwa table function
+# group: [sql]
+
+require miint
+
+require-env MINIBWA_AVAILABLE
+
+statement ok
+CREATE TABLE mb_subjects AS SELECT * FROM (VALUES
+    ('ref1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCC'),
+    ('ref2', 'TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCAAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAATTAA')
+) AS t(read_id, sequence1);
+
+statement ok
+CREATE TABLE mb_queries AS SELECT * FROM (VALUES
+    ('query1', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT'),
+    ('query2', 'TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA')
+) AS t(read_id, sequence1);
+
+# ==============================================================================
+# ERROR HANDLING (Fail Fast) -- exercised before any index exists
+# ==============================================================================
+
+statement error
+SELECT * FROM align_minibwa('mb_queries');
+----
+requires index_path
+
+statement error
+SELECT * FROM align_minibwa('mb_queries', index_path := 'no_such_minibwa_index');
+----
+minibwa index not found
+
+statement error
+SELECT * FROM align_minibwa('nonexistent_table', index_path := 'no_such_minibwa_index');
+----
+does not exist
+
+# ==============================================================================
+# BUILD INDEX, THEN CORRECTNESS TESTS
+# ==============================================================================
+
+statement ok
+SELECT * FROM save_minibwa_index('mb_subjects', 'align_minibwa_test_idx');
+
+statement error
+SELECT * FROM align_minibwa('mb_queries', index_path := 'align_minibwa_test_idx', preset := 'not_a_real_preset');
+----
+Unknown minibwa preset
+
+statement error
+SELECT * FROM align_minibwa('mb_queries', index_path := 'align_minibwa_test_idx', max_secondary := -1);
+----
+max_secondary must be >= 0
+
+query III
+SELECT read_id, reference, mapq >= 0 AS has_mapq
+FROM align_minibwa('mb_queries', index_path := 'align_minibwa_test_idx', max_secondary := 0)
+ORDER BY read_id, reference;
+----
+query1	ref1	true
+query2	ref2	true
+
+query II
+SELECT read_id, cigar != '*' AND cigar != '' AS has_cigar
+FROM align_minibwa('mb_queries', index_path := 'align_minibwa_test_idx', max_secondary := 0)
+ORDER BY read_id;
+----
+query1	true
+query2	true
+
+query II
+SELECT read_id, tag_as > 0 AS has_score
+FROM align_minibwa('mb_queries', index_path := 'align_minibwa_test_idx', max_secondary := 0)
+ORDER BY read_id;
+----
+query1	true
+query2	true
+
+query III
+SELECT read_id, position, stop_position >= position AS stop_after_start
+FROM align_minibwa('mb_queries', index_path := 'align_minibwa_test_idx', max_secondary := 0)
+ORDER BY read_id;
+----
+query1	1	true
+query2	1	true
+
+# tag_md is always NULL (documented limitation -- see docs/alignment_reference.md)
+query II
+SELECT read_id, tag_md IS NULL AS md_is_null
+FROM align_minibwa('mb_queries', index_path := 'align_minibwa_test_idx', max_secondary := 0)
+ORDER BY read_id;
+----
+query1	true
+query2	true
+
+# BIGINT read_id support
+statement ok
+CREATE TABLE mb_queries_bigint AS SELECT * FROM (VALUES
+    (1::BIGINT, 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT'),
+    (2::BIGINT, 'TGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCATGCA')
+) AS t(read_id, sequence1);
+
+query III
+SELECT read_id, reference, mapq >= 0 AS has_mapq
+FROM align_minibwa('mb_queries_bigint', index_path := 'align_minibwa_test_idx', max_secondary := 0)
+ORDER BY read_id, reference;
+----
+1	ref1	true
+2	ref2	true
+
+# A single-end query table with no mate file (sequence2 NULL for every row,
+# a common read_fastx() shape) must not be treated as paired-end.
+statement ok
+CREATE TABLE mb_queries_general_schema AS SELECT * FROM mb_queries, (SELECT NULL::VARCHAR AS sequence2) s;
+
+query I
+SELECT count(*) FROM align_minibwa('mb_queries_general_schema', index_path := 'align_minibwa_test_idx', max_secondary := 0);
+----
+2
