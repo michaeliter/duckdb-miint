@@ -1,4 +1,5 @@
 #include "rype_log_ratio.hpp"
+#include "catalog_utils.hpp"
 #include "rype_common.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/printer.hpp"
@@ -149,10 +150,11 @@ unique_ptr<GlobalTableFunctionState> RypeLogRatioTableFunction::InitGlobal(Clien
 	// Store connection in GlobalState — see rype_classify.cpp InitGlobal for rationale.
 	auto &db = DatabaseInstance::GetDatabase(context);
 	gstate->input_connection = make_uniq<Connection>(db);
+	InheritTempObjects(context, *gstate->input_connection);
 	auto &conn = *gstate->input_connection;
 
-	// Use Arrow BinaryView (v1.4+) — see rype_classify.cpp InitGlobal for rationale.
-	conn.Query("SET arrow_output_version = '1.4'");
+	// Export BLOB with 64-bit offsets — see ConfigureRypeArrowExport in rype_common.hpp (#222).
+	ConfigureRypeArrowExport(conn);
 
 	std::string id_col_quoted = KeywordHelper::WriteOptionallyQuoted(bind_data.id_column);
 	std::string table_quoted = KeywordHelper::WriteOptionallyQuoted(bind_data.sequence_table);
@@ -169,15 +171,19 @@ unique_ptr<GlobalTableFunctionState> RypeLogRatioTableFunction::InitGlobal(Clien
 	// Log-ratio loads shards from BOTH indices per batch, so use whichever index has larger
 	// shards for a conservative memory estimate. rype_recommend_batch_size accounts for shard
 	// size in its memory budget, so the index with larger shards yields a smaller batch size.
-	int is_paired = bind_data.has_sequence2 ? 1 : 0;
+	//
+	// is_paired follows sequence2 CONTENT, not the column's presence (#199) — see
+	// rype_classify.cpp InitGlobal and TableHasPairedContent in rype_common.hpp for rationale.
+	int is_paired = TableHasPairedContent(conn, KeywordHelper::WriteOptionallyQuoted(gstate->tmp_table_name)) ? 1 : 0;
 
 	size_t num_shard_bytes = rype_index_largest_shard_bytes(gstate->numerator_index);
 	size_t denom_shard_bytes = rype_index_largest_shard_bytes(gstate->denominator_index);
 	const RypeIndex *sizing_index =
 	    (denom_shard_bytes > num_shard_bytes) ? gstate->denominator_index : gstate->numerator_index;
 
-	// is_large_binary=1: sub-connection uses arrow_large_buffer_size=true, so DuckDB
-	// exports BLOB as Arrow LargeBinary (i64 offsets) — no 2 GiB per-array limit.
+	// is_large_binary=1 tells RYpe to skip its 2 GiB batch cap. That is only sound
+	// because ConfigureRypeArrowExport pinned this connection to Arrow LargeBinary
+	// (i64 offsets) above — the two must be changed together (#222).
 	size_t batch_size = rype_recommend_batch_size(sizing_index, avg_read_length, is_paired, 0, 1);
 	if (batch_size == 0) {
 		// rype_recommend_batch_size returns 0 on error — log but use safe fallback

@@ -9,6 +9,23 @@ if grep -nE '\bmake\b[^\n]*\bclean\b[^\n]*(\blib[A-Za-z0-9_]+\.a\b|\ball\b)' CMa
     exit 1
 fi
 
+# mmvec compiles its objective once per instruction set and picks at load time, so
+# a fit's result depends on the CPU running it -- the same property scikit-bio has
+# through OpenBLAS, and an accepted one. Expected values in the SQL tests are
+# carved against the BASELINE kernel, so pin it here: without this the suite would
+# assert different numbers on an AVX-512 CI runner than on an AVX2 one, and a real
+# regression would be indistinguishable from a change of machine.
+#
+# The wide variants are not left untested by this. test/cpp/test_MMvec.cpp calls
+# each one directly -- no environment variable involved, since DetectIsa() memoizes
+# and one process can only ever observe one dispatch decision -- and checks them
+# against baseline within the carved kIsa*Tol bands.
+#
+# Honours an externally-set value so `MIINT_SIMD=avx512 bash run_tests.sh` still
+# works for a deliberate cross-check.
+export MIINT_SIMD="${MIINT_SIMD:-baseline}"
+echo "MIINT_SIMD=$MIINT_SIMD (mmvec kernel; expected values are carved against 'baseline')"
+
 # Start local HTTP server for HTTPS reader tests (unless already set externally)
 HTTP_SERVER_PID=""
 if [ -z "$MIINT_HTTPS_TEST_URL" ]; then
@@ -188,17 +205,20 @@ fi
 
 # ASR (ancestral-state) parity goldens: independent ground-truth reconstructions
 # (Brownian-motion GLS via the phylogenetic VCV; ape::ace for the discrete Mk models).
-# The NUMERIC CSVs under data/asr/ ARE the fixed expected output -- committed and
-# pinned by data/asr/goldens.sha256, so there is nothing to regenerate here. The
-# offline generator is a dev-only R + ape (GPL) tool deliberately kept out of this
-# BSD tree (../duckdb-miint-localdocs/gen_asr_oracle.R); ape's code is never committed
-# or distributed -- only its numeric output is. The gate below just verifies the
-# committed goldens are intact before the parity test runs (require-env MIINT_ASR_PARITY_OK).
-if [ -f data/asr/goldens.sha256 ] && (cd data/asr && sha256sum -c --quiet goldens.sha256) 2>/dev/null; then
-    export MIINT_ASR_PARITY_OK=1
-else
-    echo "Warning: ASR parity goldens missing or corrupt; parity test skipped"
-fi
+# The NUMERIC CSVs under data/asr/ ARE the fixed expected output -- COMMITTED, so they
+# are always present and need no availability gate. The offline generator is a dev-only
+# R + ape (GPL) tool deliberately kept out of this BSD tree
+# (../duckdb-miint-localdocs/gen_asr_oracle.R); ape's code is never committed or
+# distributed -- only its numeric output is.
+#
+# These previously sat behind a require-env MIINT_ASR_PARITY_OK gate driven by
+# `sha256sum -c` against a data/asr/goldens.sha256 manifest. Both the gate and the
+# manifest were removed for the same reason as the data/simsurvey/ ones below:
+# `sha256sum -c` also fails on a MISMATCH, so a corrupted or edited golden SKIPPED the
+# parity test and left CI green -- the exact opposite of the intended protection, and a
+# Rule 10 (fail loud) violation. The parity tests themselves are the integrity check,
+# and they now always run: a corrupted golden fails them, and a missing one fails the
+# read_csv_auto that loads it.
 
 # NOTE: the Kuczynski-2010 oracle bands, community_distances distance goldens and
 # cluster_kmeans/cluster_upgma parity goldens under data/simsurvey/ are COMMITTED,
