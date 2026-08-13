@@ -44,7 +44,14 @@ const std::string READ_GFF = // NOLINT
     "   column1 AS source, "
     "   column2 AS type, "
     "   column3::INTEGER AS position, "
-    "   column4::INTEGER AS stop_position, "
+    // GFF3's `end` is 1-based CLOSED; miint's project-wide convention is 1-based HALF-OPEN
+    // [position, stop_position), as used by read_alignments, align_*, alignment_slice,
+    // compute_coverage_depth and genome_coverage. Normalize on read (+1) so `stop_position`
+    // means the same thing everywhere. Before this, read_gff was the outlier while sharing
+    // the column NAME, so composing it with any of those silently dropped the interval's
+    // last base -- genome_coverage's SUM(stop - start) under-counted every feature by one.
+    // The raw GFF `end` is recoverable as `stop_position - 1` (issue #196).
+    "   column4::INTEGER + 1 AS stop_position, "
     "   CASE  "
     "     WHEN column5 = '.' THEN NULL  "
     "     ELSE column5::DOUBLE  "
@@ -76,7 +83,37 @@ const std::string READ_GFF = // NOLINT
     "   skip = 0, "
     "   null_padding = true "
     " ) "
-    "WHERE column0 NOT LIKE '##%'; ";
+    "WHERE column0 NOT LIKE '##%' "
+    // The GFF3 sequence section (issue #186). Everything after a ##FASTA directive is
+    // FASTA, and prokka/bakta ALWAYS append the genome -- so this is the common case. Those
+    // lines contain no tabs, so with null_padding every mandatory field after column0
+    // parses as NULL. Dropped silently: appended FASTA is expected file content.
+    //
+    // Some-but-not-all mandatory fields present is a different thing -- a broken feature
+    // line -- and is raised rather than dropped, so we don't trade one silent wrong answer
+    // for another. column8 (attributes) is deliberately NOT required: a legitimate line may
+    // end with an empty attributes field, which also parses as NULL, so keying off it would
+    // reject real prokka output.
+    //
+    // This MUST live in the WHERE clause, not a projection: DuckDB prunes unused
+    // projections, so a check inside a SELECT expression would not fire for
+    // `SELECT type FROM read_gff(...)` -- the very shape the issue reported.
+    "  AND CASE "
+    // A FASTA header line, checked FIRST because its description may itself contain tabs
+    // (e.g. ">ctg1<TAB>some description"), which would otherwise populate column1 and trip
+    // the malformed-feature branch below on a perfectly valid file. '>' is not a legal GFF3
+    // seqid character, so this prefix identifies FASTA unambiguously.
+    "        WHEN column0 LIKE '>%' THEN FALSE "
+    "        WHEN column1 IS NULL AND column2 IS NULL AND column3 IS NULL "
+    "         AND column4 IS NULL AND column5 IS NULL AND column6 IS NULL "
+    "         AND column7 IS NULL THEN FALSE "
+    "        WHEN column1 IS NULL OR column2 IS NULL OR column3 IS NULL "
+    "          OR column4 IS NULL OR column5 IS NULL OR column6 IS NULL "
+    "          OR column7 IS NULL "
+    "        THEN error(printf('read_gff: malformed GFF feature line "
+    "(expected 9 tab-separated fields, found fewer): %s', column0)) "
+    "        ELSE TRUE "
+    "      END; ";
 
 // read_jplace(path)
 //
@@ -949,6 +986,62 @@ const std::string BETA_KNN_FROM_SAMPLE = // NOLINT
     "    SELECT sample_a AS neighbor, distance FROM query_table(distances) WHERE sample_b = source "
     ") ORDER BY distance, neighbor LIMIT k; ";
 
+// mmvec_train_test_split(relation, test_fraction, seed)
+//
+// Split a long-form feature-table's SAMPLES into 'train' and 'test', for holding
+// data back from mmvec_fit and scoring on it with mmvec_score. Returns one row per
+// distinct sample_id: (sample_id, split), sample_id passed through with its own
+// type so it joins back to the feature table without a cast.
+//
+// ONE relation, not two. mmvec_fit requires its X and Y tables to describe exactly
+// the same samples and validates that itself, so a second relation would carry no
+// information -- split either one and filter both by the result.
+//
+// Exactly round(n * test_fraction) samples are assigned 'test' (rounding half away
+// from zero, so 10 samples at 0.35 gives 4). test_fraction outside [0, 1] is an
+// error rather than a silent all-train or all-test.
+//
+// NULL is rejected before the range test, and has to be: SQL's three-valued logic
+// makes `NULL < 0 OR NULL > 1` evaluate to NULL rather than true, so a NULL would
+// fall past a range test written on its own. It would then make n_test NULL, make
+// `rn <= n_test` NULL, and land every sample in the ELSE branch -- an all-train
+// split, silently, which is the exact outcome the range check exists to prevent.
+// A NULL seed is rejected for the same class of reason: md5(NULL || ...) is NULL
+// for every row, so the ordering would collapse to plain alphabetical by sample_id
+// and the split would look seeded without being seeded.
+//
+// The assignment is a deterministic function of (sample_id, seed) alone: samples
+// are ordered by md5(seed || ':' || sample_id) and the first n_test taken. Ties are
+// broken by sample_id, so the result depends on neither the input row order nor how
+// the scan was parallelized, and re-running it -- in another session, on a permuted
+// table -- gives the same split. md5 rather than DuckDB's hash() deliberately: hash()
+// is an implementation detail that may change between versions, whereas md5 is
+// specified, so a split recorded in a paper still reproduces after an upgrade. Not a
+// cryptographic claim -- this is a permutation, not a secret.
+//
+// A sample-wise split routinely leaves test-only FEATURES in the held-out tables,
+// which mmvec_predict and mmvec_score reject by design (there is no conditional
+// probability for a feature the model never saw). Restrict the test tables to the
+// model's own features first -- their error messages name the exact predicate.
+const std::string MMVEC_TRAIN_TEST_SPLIT = // NOLINT
+    "CREATE OR REPLACE MACRO mmvec_train_test_split(relation, test_fraction, seed) AS TABLE "
+    "SELECT sample_id, "
+    "       CASE WHEN test_fraction IS NULL "
+    "              THEN error('mmvec_train_test_split: test_fraction must not be NULL') "
+    "            WHEN seed IS NULL "
+    "              THEN error('mmvec_train_test_split: seed must not be NULL') "
+    "            WHEN test_fraction < 0 OR test_fraction > 1 "
+    "              THEN error(printf('mmvec_train_test_split: test_fraction must be in [0, 1], got %s', "
+    "                                CAST(test_fraction AS VARCHAR))) "
+    "            WHEN rn <= n_test THEN 'test' ELSE 'train' END AS split "
+    "FROM ( "
+    "    SELECT sample_id, "
+    "           ROW_NUMBER() OVER (ORDER BY md5(CAST(seed AS VARCHAR) || ':' || CAST(sample_id AS VARCHAR)), "
+    "                                       sample_id) AS rn, "
+    "           CAST(round(COUNT(*) OVER () * test_fraction) AS BIGINT) AS n_test "
+    "    FROM (SELECT DISTINCT sample_id FROM query_table(relation)) "
+    "); ";
+
 class MIINTMacros {
 public:
 	static void Register(ExtensionLoader &loader) {
@@ -1030,6 +1123,8 @@ public:
 		register_macro(BETA_GROUP_DISTANCES, "beta_group_distances");
 		register_macro(BETA_KNN, "beta_knn");
 		register_macro(BETA_KNN_FROM_SAMPLE, "beta_knn_from_sample");
+
+		register_macro(MMVEC_TRAIN_TEST_SPLIT, "mmvec_train_test_split");
 	}
 };
 

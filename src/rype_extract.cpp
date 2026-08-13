@@ -1,4 +1,5 @@
 #include "rype_extract.hpp"
+#include "catalog_utils.hpp"
 #include "rype_common.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/config.hpp"
@@ -89,10 +90,11 @@ BuildExtractionInputStream(ClientContext &context, const RypeExtractData &bind_d
 	// Store connection in GlobalState — see rype_classify.cpp InitGlobal for rationale.
 	auto &db = DatabaseInstance::GetDatabase(context);
 	gstate->input_connection = make_uniq<Connection>(db);
+	InheritTempObjects(context, *gstate->input_connection);
 	auto &conn = *gstate->input_connection;
 
-	// Use Arrow BinaryView (v1.4+) — see rype_classify.cpp InitGlobal for rationale.
-	conn.Query("SET arrow_output_version = '1.4'");
+	// Export BLOB with 64-bit offsets — see ConfigureRypeArrowExport in rype_common.hpp (#222).
+	ConfigureRypeArrowExport(conn);
 
 	std::string id_col_quoted = KeywordHelper::WriteOptionallyQuoted(bind_data.id_column);
 	std::string table_quoted = KeywordHelper::WriteOptionallyQuoted(bind_data.sequence_table);

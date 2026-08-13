@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rype.h"
+#include "catalog_utils.hpp"
 #include "id_column_utils.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -8,6 +9,7 @@
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"
+#include "duckdb/common/enums/arrow_format_version.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -75,6 +77,45 @@ inline size_t SampleAvgReadLength(Connection &conn, const std::string &table_quo
 		}
 	}
 	return fallback;
+}
+
+//! Whether a materialized RYpe input table actually carries paired reads: true iff
+//! at least one row has a non-NULL sequence2.
+//!
+//! Callers must use this rather than the mere presence of a `sequence2` column.
+//! read_fastx always emits that column (see read_fastx.hpp), so single-end reads
+//! loaded the obvious way arrive with it all-NULL. Treating that as paired-end
+//! doubles RYpe's per-read memory estimate, which roughly halves the batch size,
+//! which doubles the number of full index loads — measured at ~1.8 h of waste on a
+//! 4 h job (#199).
+//!
+//! Deliberately a FULL scan, unlike SampleAvgReadLength's LIMIT 1000: a paired row
+//! beyond the sample would be missed, and a false negative under-budgets memory,
+//! which is the direction that OOMs. A false positive only costs time.
+//!
+//! Returns false for an empty table: bool_or over zero rows is NULL, and zero rows
+//! genuinely means zero paired rows, so false is the correct answer there rather
+//! than a guess.
+//!
+//! Throws on query failure — it does NOT fall back to false. Falling back would
+//! produce exactly the false negative described above, i.e. the OOM direction, and
+//! it would do so precisely when memory pressure is the likeliest cause of the
+//! failure. This query differs from the id_query in MaterializeRypeInputTempTable
+//! only in which column it selects, off the same just-created temp table on the same
+//! connection, and that one throws too; if this fails while its sibling succeeded,
+//! something is already wrong and Rule 10 says say so.
+inline bool TableHasPairedContent(Connection &conn, const std::string &table_quoted) {
+	auto result = conn.Query("SELECT bool_or(sequence2 IS NOT NULL) FROM " + table_quoted);
+	if (result->HasError()) {
+		throw InvalidInputException("Failed to detect paired content in temp table: %s", result->GetError());
+	}
+	auto &materialized = result->Cast<MaterializedQueryResult>();
+	auto chunk = materialized.Fetch();
+	if (!chunk || chunk->size() == 0) {
+		return false;
+	}
+	auto val = chunk->data[0].GetValue(0);
+	return !val.IsNull() && val.GetValue<bool>();
 }
 
 //! Column names (lowercased) and their storage types for a table/view,
@@ -209,6 +250,7 @@ inline void ValidateTableHasColumns(ClientContext &context, const std::string &t
 //
 // Usage pattern (in InitGlobal, on a per-GlobalState sub-Connection):
 //
+//   ConfigureRypeArrowExport(conn);
 //   gstate->tmp_table_name = MaterializeRypeInputTempTable(
 //       conn, table_quoted, id_col_quoted, source_name_for_errors,
 //       has_sequence2, "_rype_classify_", gstate->read_ids,
@@ -223,6 +265,58 @@ inline void ValidateTableHasColumns(ClientContext &context, const std::string &t
 // The destructor must call DropRypeTempTable(*input_connection,
 // gstate->tmp_table_name) AFTER releasing the RYpe output stream and BEFORE
 // resetting input_connection.
+
+//! Pin `conn` to exporting variable-length columns with 64-bit offsets (Arrow
+//! LargeBinary / LargeUtf8). Call once on the sub-connection, before building any
+//! RYpe input stream.
+//!
+//! Do NOT express this as `arrow_output_version = '1.4'` (BinaryView). BinaryView
+//! lifts the limit on the *number* of variadic data buffers, not the 32-bit offset
+//! field inside each view, and DuckDB emits exactly one buffer with `buffer_index`
+//! hardcoded to 0. That offset is written through `UnsafeNumericCast<int32_t>`,
+//! which is an unchecked `static_cast` in release builds, so a record batch
+//! carrying more than 2 GiB of sequence silently truncates it modulo 2^32. RYpe
+//! reads the field as u32 and is handed a *different read's* bytes under the
+//! correct read_id; a spec-conformant signed reader indexes before the buffer
+//! entirely. Both boundaries were measured exactly (#222). Batch size is derived
+//! from available memory, so a large corpus on a large machine reaches this
+//! routinely rather than exceptionally.
+//!
+//! BOTH settings must be pinned, not just the offset size: for BLOB the BinaryView
+//! branch wins over `arrow_large_buffer_size` in ArrowAppender's type dispatch, and
+//! both settings are GLOBAL_DEFAULT scope — so a caller who has done
+//! `SET arrow_output_version='1.4'` for their own reasons would otherwise have it
+//! inherited by this fresh sub-connection and silently reintroduce the corruption.
+//!
+//! Throws rather than warns. Continuing on failure would fall back to 32-bit
+//! offsets, which is precisely the corruption this exists to prevent.
+inline void ConfigureRypeArrowExport(Connection &conn) {
+	// SET SESSION, not bare SET. Both settings are GLOBAL_DEFAULT scope, meaning a
+	// bare SET writes the *global* default — which is shared with the user's own
+	// connection. The pre-#222 code used a bare SET and so silently rewrote the
+	// caller's global arrow_output_version to '1.4' as a side effect of classifying,
+	// changing the format of their own unrelated Arrow exports. Session scope keeps
+	// this confined to the sub-connection that feeds RYpe.
+	for (const char *stmt :
+	     {"SET SESSION arrow_large_buffer_size = true", "SET SESSION arrow_output_version = '1.0'"}) {
+		auto result = conn.Query(stmt);
+		if (result->HasError()) {
+			throw InvalidInputException("Failed to configure Arrow export for RYpe (%s): %s", stmt, result->GetError());
+		}
+	}
+
+	// Verify what the settings actually resolved to rather than trusting that the
+	// statements above mean what we think. This is the assertion that fails loudly
+	// if the export format is ever changed out from under RYpe again.
+	auto props = conn.context->GetClientProperties();
+	if (props.arrow_offset_size != ArrowOffsetSize::LARGE || props.arrow_output_version >= ArrowFormatVersion::V1_4) {
+		throw InvalidInputException(
+		    "RYpe Arrow export must use 64-bit offsets: expected arrow_large_buffer_size=true and "
+		    "arrow_output_version < 1.4, got offset_size=%s output_version=%d",
+		    props.arrow_offset_size == ArrowOffsetSize::LARGE ? "LARGE" : "REGULAR",
+		    static_cast<int>(props.arrow_output_version));
+	}
+}
 
 //! Materialize the user's sequence_table into a per-call TEMP table on `conn`,
 //! populate `out_read_ids` from it ordered by the synthetic id, and sample the
@@ -305,16 +399,20 @@ BuildRypeArrowInput(Connection &conn, const std::string &tmp_table_name, bool in
 	return make_uniq<ResultArrowArrayStreamWrapper>(std::move(query_result), batch_size);
 }
 
-//! Drop the per-call TEMP table on `conn`. Safe with empty name (no-op) and
-//! with a name that doesn't exist (uses IF EXISTS). Errors are silently
-//! ignored — this runs in destructors where we cannot usefully propagate
-//! failures, and the connection's catalog cleanup will reap the table on
-//! teardown anyway.
+//! Drop the per-call TEMP table on `conn`. Safe with empty name (no-op) and with a
+//! name that doesn't exist (uses IF EXISTS). Never throws — this runs in destructors.
+//!
+//! This drop is REQUIRED, not merely an early release of memory. The rype input
+//! connections inherit the caller's TEMP catalog (#193, so a TEMP sequence_table
+//! resolves), which means the table lives in the user's session and does NOT get
+//! reaped when the connection is torn down. A failure therefore leaks an internal
+//! relation into the user's catalog, which is why DropHelperTempRelation warns
+//! instead of discarding the error.
 inline void DropRypeTempTable(Connection &conn, const std::string &tmp_table_name) {
 	if (tmp_table_name.empty()) {
 		return;
 	}
-	conn.Query("DROP TABLE IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(tmp_table_name));
+	DropHelperTempRelation(conn, KeywordHelper::WriteOptionallyQuoted(tmp_table_name));
 }
 
 } // namespace duckdb
