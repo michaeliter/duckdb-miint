@@ -130,6 +130,14 @@ private:
 // Exposed for testing. Not part of the supported surface.
 namespace krepp_detail {
 
+// IUPAC nucleotide codes, both cases. krepp subscripts a 128-entry table with a
+// plain char, so bytes outside ASCII are not merely unmatched - they index out
+// of range. Shared with the index builder, which needs the same rule for
+// reference sequences: a stray newline followed by '>' in a sequence would
+// otherwise open a second FASTA record inside a reference's file, and krepp
+// folds every record in that file into the same leaf.
+extern const char *const kNucleotideAlphabet;
+
 // Rejects the Newick shapes krepp's split_nwk refuses, before krepp ever sees
 // the file. krepp reports every one of them by calling error_exit, which is
 // std::exit, so without this a perfectly ordinary tree - one indented, or with

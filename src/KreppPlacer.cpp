@@ -40,11 +40,6 @@ const std::set<std::string> kWithoutBackbone = {"cmer", "crecord", "inc", "metad
 // plain char, so bytes outside ASCII are not merely unmatched - they index out
 // of range.
 //
-// U and u are accepted only because place() rewrites them to T and t before
-// krepp sees them; krepp's own table maps them to the ambiguous code, so an RNA
-// read would otherwise validate here and then place nothing.
-const char *const kNucleotideAlphabet = "ACGTURYKMSWBDHVNacgturykmswbdhvn";
-
 // Groups the files in index_dir by their "-m4r1-frac" style suffix. Mirrors how
 // krepp names the pieces of a partial index.
 std::map<std::string, std::set<std::string>> DiscoverPartials(const std::string &index_dir) {
@@ -71,6 +66,11 @@ std::map<std::string, std::set<std::string>> DiscoverPartials(const std::string 
 } // namespace
 
 namespace krepp_detail {
+
+// U and u are accepted only because place() rewrites them to T and t before
+// krepp sees them; krepp's own table maps them to the ambiguous code, so an RNA
+// read would otherwise validate here and then place nothing.
+const char *const kNucleotideAlphabet = "ACGTURYKMSWBDHVNacgturykmswbdhvn";
 
 void ValidateNewickLexically(const std::string &newick_text, const std::string &path) {
 	// krepp's split_nwk runs before any parsing and rejects several shapes
@@ -483,7 +483,7 @@ size_t KreppPlacer::place(const std::vector<KreppQuery> &queries, std::vector<Kr
 	sequences.reserve(queries.size());
 	ids.reserve(queries.size());
 	for (const KreppQuery &query : queries) {
-		const size_t bad = query.sequence.find_first_not_of(kNucleotideAlphabet);
+		const size_t bad = query.sequence.find_first_not_of(krepp_detail::kNucleotideAlphabet);
 		if (bad != std::string::npos) {
 			throw miint::InvalidInputException(
 			    "Query sequence for '" + query.id + "' contains a character that is not a nucleotide code: byte " +

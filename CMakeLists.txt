@@ -1346,7 +1346,7 @@ if(MIINT_ENABLE_KREPP)
     # file. Nothing includes them bare today, so this is latent rather than a
     # live bug - but the seq_nt4_table breakage below was latent in exactly the
     # same way until a header happened to line up, so scope it now.
-    set_source_files_properties(src/KreppPlacer.cpp PROPERTIES
+    set_source_files_properties(src/KreppPlacer.cpp src/KreppIndexBuilder.cpp PROPERTIES
         INCLUDE_DIRECTORIES "${KREPP_DIR}/src;${PHMAP_INCLUDE_DIR};${BOOST_MATH_INCLUDE_DIR}")
     # These three belong to the ONE translation unit that includes krepp's
     # headers, not to the targets. Applied target-wide they also rewrote the
@@ -1357,7 +1357,7 @@ if(MIINT_ENABLE_KREPP)
     # the out-of-bounds the rename exists to prevent, pointed the wrong way.
     # Source-file properties are directory-scoped, so this reaches
     # miint_extension, miint_loadable_extension and tests alike.
-    set_source_files_properties(src/KreppPlacer.cpp PROPERTIES
+    set_source_files_properties(src/KreppPlacer.cpp src/KreppIndexBuilder.cpp PROPERTIES
         COMPILE_DEFINITIONS "_WOPENMP=0;_WLCURL=0;seq_nt4_table=krepp_seq_nt4_table")
 endif()
 if(MIINT_ENABLE_VSEARCH)
@@ -1672,7 +1672,8 @@ if(MIINT_ENABLE_ABPOA)
     list(APPEND EXTENSION_SOURCES src/AbpoaAligner.cpp src/align_abpoa.cpp src/consensus_abpoa.cpp)
 endif()
 if(MIINT_ENABLE_KREPP)
-    list(APPEND EXTENSION_SOURCES src/KreppPlacer.cpp src/place_krepp.cpp)
+    list(APPEND EXTENSION_SOURCES src/KreppPlacer.cpp src/place_krepp.cpp
+        src/KreppIndexBuilder.cpp src/krepp_index_create.cpp)
 endif()
 if(MIINT_ENABLE_SORTMERNA)
     list(APPEND EXTENSION_SOURCES src/SortMeRNAAligner.cpp src/align_sortmerna.cpp src/align_sortmerna_rrna.cpp)

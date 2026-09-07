@@ -66,6 +66,7 @@
 #include <align_mafft.hpp>
 #endif
 #ifdef MIINT_HAS_KREPP
+#include "krepp_index_create.hpp"
 #include "place_krepp.hpp"
 #endif
 #ifdef MIINT_HAS_ABPOA
@@ -409,6 +410,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	AlignSortMeRNARRNATableFunction::Register(loader);
 #endif
 #ifdef MIINT_HAS_KREPP
+	// Before any krepp call can happen, which is what krepp's set_error_handler
+	// asks for: error_exit reads the handler without a lock, so installing it
+	// later - once a query might already be inside krepp - would be a data
+	// race. Turns krepp's std::exit into an exception for place_krepp too.
+	miint::InstallKreppErrorHandler();
+	KreppIndexCreateTableFunction::Register(loader);
 	PlaceKreppTableFunction::Register(loader);
 #endif
 #ifdef MIINT_HAS_SYLPH

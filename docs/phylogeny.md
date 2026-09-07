@@ -7,6 +7,7 @@ Methods for estimating and operating on phylogenies.
 - [Shear (subset to tips)](#shear-subset-to-tips) - Prune a tree down to a set of tips.
 - [Resolve multifurcations](#resolve-multifurcations) - Resolve polytomies into a strictly bifurcating tree.
 - [Phylogenetic placement (krepp)](#phylogenetic-placement-krepp) - Place query sequences onto a backbone phylogeny with krepp.
+- [Build a krepp index](#build-a-krepp-index) - Build the index `place_krepp` reads, from relations.
 - [Resolve placements](#resolve-placements) - Fully resolve sequence placements against a backbone.
 - [FastTree](#fasttree) - Estimate a phylogeny from a MSA with FastTree.
 - [Independent contrasts (PIC)](#independent-contrasts-pic) - Felsenstein (1985) phylogenetic independent contrasts.
@@ -137,7 +138,7 @@ COPY (
 
 Place query sequences onto a backbone phylogeny using [krepp](https://github.com/bo1929/krepp), which matches *k*-mers against a prebuilt LSH index and maximises a pseudo-likelihood over candidate edges. Column names follow [`read_jplace`](reading.md#jplace) where the two overlap, so downstream SQL written for one mostly reads the other — but the schemas are not union-compatible: `read_jplace` ends in `filepath` and reports only the best placement per fragment, while this ends in `distance` and, with `multi` on, reports every candidate edge.
 
-Requires an index built beforehand by the krepp command-line tool (`krepp index -i <map.tsv> -o <index_dir> -t <tree.nwk>`); miint reads an index, it does not build one.
+Requires an index built beforehand, either by [`krepp_index_create`](#build-a-krepp-index) from relations already in the database, or by the krepp command-line tool (`krepp index -i <map.tsv> -o <index_dir> -t <tree.nwk>`).
 
 **Function signature**:
 
@@ -251,6 +252,73 @@ SELECT * FROM tree_resolve_placement('ref_tree', 'placements');
 ```
 
 **Availability:** built when `MIINT_ENABLE_KREPP` is on, which excludes WASM and Windows. Check with `SELECT * FROM miint_versions() WHERE library = 'krepp';`.
+
+### Build a krepp index
+
+Build the index [`place_krepp`](#phylogenetic-placement-krepp) reads, from relations already in the database. The same linked krepp writes it and reads it, so the writer's version and the reader's version cannot drift apart — which matters more here than it sounds: an index written by a different krepp is *misread* rather than rejected (v0.9.0 swapped the recursion branches in `Node::generate_tree`), and as of 2026-09-05 bioconda's newest krepp is 0.8.2 against the v0.9.1+ this links.
+
+**Function signature**:
+
+`krepp_index_create(sequence_table, output_path [, tree_table | newick_path, k, w, h, m, r, frac, sdust_t, sdust_w])`
+
+**Parameters:**
+- `sequence_table` (VARCHAR, required, positional): Name of a table or view holding the reference sequences. Requires `read_id` and `sequence1` columns, the same contract as the aligners and [`save_bowtie2_index`](alignment_reference.md); `read_id` may be VARCHAR, BIGINT or UUID, as it may for `place_krepp`'s `query_table`.
+
+  **Every distinct `read_id` becomes one krepp reference, and every row carrying that `read_id` becomes one record inside it.** A multi-contig genome is therefore just several rows sharing a `read_id` — there is no separate mapping table. Reassemble chunked storage first, e.g. `SELECT feature_id AS read_id, string_agg(chunk_data ORDER BY chunk_index) AS sequence1 FROM chunks GROUP BY feature_id`.
+- `output_path` (VARCHAR, required, positional): Directory to write the index into. It must not already exist as a non-empty directory: krepp writes files whose names encode the resolved config and never clears what is already there, so building into a populated directory would leave two indexes side by side and `place_krepp` would load both. Nothing is deleted — the call is refused instead.
+- `tree_table` (VARCHAR): Name of a table or view holding the backbone tree in [`read_newick`](reading.md#newick)'s row shape (`node_index`, `parent_index`, `name`, `branch_length`, `edge_id`). **This is the form to prefer.** The tree never becomes a file the caller has to render, so none of the strict-Newick hazards listed under `place_krepp`'s `newick_path` apply — there is no indentation, no CRLF, no `[&R]` marker to get wrong. An `edge_id` column is carried through the build and comes back verbatim as `place_krepp`'s `edge_num`.
+- `newick_path` (VARCHAR): Backbone tree as a Newick file, for callers who already have one. Held to exactly the same strictness `place_krepp` applies to its own `newick_path`, and checked before krepp sees it.
+
+  Exactly one of `tree_table` and `newick_path` is required. krepp will build without a backbone — it invents a tree from the reference names and then writes no tree file at all — but `place_krepp` cannot use that index without being handed a separate Newick, so the no-tree case is refused here rather than left as a trap.
+- `k` (INTEGER, default 29): *k*-mer length. krepp requires 19 ≤ *k* ≤ 31.
+- `w` (INTEGER, default *k* + 6): Minimizer window. Must be at least *k*.
+- `h` (INTEGER, default *k* − 16): Number of LSH positions. krepp requires 9 ≤ *h* ≤ 15, and *h* ≥ *k* − 16.
+- `m` (INTEGER, default 4), `r` (INTEGER, default 1), `frac` (BOOLEAN, default true): Partitioning of the *k*-mer space, exactly as krepp's `--m`, `--r` and `--frac`. These decide the index's filename suffix (`-m4r1-frac`).
+- `sdust_t` (INTEGER, default 0), `sdust_w` (INTEGER, default 0): SDUST low-complexity masking threshold and window. Both 0 disables masking; krepp warns that enabling it makes its subsampling model slightly inaccurate.
+
+**Output schema:** one row.
+- `output_path` (VARCHAR): The directory written.
+- `k`, `w`, `h` (INTEGER): The resolved parameters, **read back from the index krepp wrote** rather than echoed from the request — so a `w` or `h` left to default reports what was actually derived.
+- `num_references` (BIGINT): Distinct `read_id`s indexed.
+- `status` (VARCHAR): `'ok'`. Failures raise.
+
+**Name matching is the failure this function exists to catch.** krepp builds by walking the backbone tree and looking each tip up in its reference map, so the two name sets decide what ends up in the index:
+
+| Case | krepp alone | `krepp_index_create` |
+|---|---|---|
+| A reference the tree does not name | Never visited. Absent from the index, with no message of any kind | **Raises**, naming up to five of them |
+| A tree tip with no reference | Prints `Genome skipped:` to stderr, which nothing in a SQL session sees | Warns with the count (see [`miint_warnings`](utilities.md)) and continues — a backbone wider than the reference set is legitimate |
+
+A reference name that Newick would have to quote (whitespace, or one of `()[]{},:;'"`) is also rejected: it would reach krepp quoted in the tree and bare in the map, and krepp matches the two by string equality, so the reference would silently contribute nothing. So is a name starting with `>` or `@`: krepp decides whether its input is a reference map or a FASTA from the first byte of the file, and the map's first line starts with a reference name.
+
+**Example:**
+
+```sql
+-- References as rows: one row per contig, the genome id as read_id.
+CREATE TABLE refs AS
+SELECT regexp_extract(filepath, '([^/]+)\.fna$', 1) AS read_id, sequence1
+FROM read_fastx('genomes/*.fna', include_filepath := true);
+
+-- The backbone, with edge ids of our own that must survive to placement.
+CREATE TABLE backbone AS SELECT * FROM read_newick('backbone.nwk');
+
+SELECT * FROM krepp_index_create('refs', 'my_index', tree_table := 'backbone',
+                                 k := 27, w := 35, h := 11);
+-- my_index  27  35  11  25  ok
+
+SELECT * FROM place_krepp(query_table := 'reads', index_path := 'my_index');
+```
+
+**Behavior:**
+- **The build is single-threaded.** krepp parallelises its index build with OpenMP, and miint compiles krepp with the pragmas off (`_WOPENMP=0`, no `-fopenmp`) so that a fatal error inside krepp can unwind as an exception instead of terminating the process. There is deliberately no `threads` parameter rather than one that does nothing.
+- **krepp writes progress to stderr** — one line per tree node — which appears in the terminal rather than in the query result.
+- **The index depends on the order rows arrive in.** krepp's k-mer extraction for one reference is sensitive to the order of the records inside that reference's FASTA, and those records are written in the order `sequence_table` yields them — which SQL does not guarantee without an `ORDER BY`. Measured on a two-reference fixture, the same three rows grouped by `read_id` produce a k-mer table 8 bytes (one k-mer) larger than the same rows interleaved. The indexes are equally valid; they are not byte-identical. Add an `ORDER BY` to `sequence_table` if you need a reproducible artifact.
+- The function materialises one FASTA per reference in a temporary directory (under `$TMPDIR`) and hands krepp a `name -> path` map, because that is the only shape krepp's builder accepts *with* a guide tree: handed a single FASTA it switches to per-sequence mode, where each record is its own reference and a guide tree is refused outright. The temporary directory is removed when the call finishes, successfully or not. One file is open at a time, so the descriptor cost does not grow with the reference count; rows sharing a `read_id` that are not adjacent cost an extra open apiece, so grouping them pays.
+- **Reference sequences are held to the IUPAC nucleotide alphabet** (`ACGTURYKMSWBDHVN`, either case) — the same rule [`place_krepp`](#phylogenetic-placement-krepp) applies to queries, for two reasons rather than one. A byte above 127 indexes past the end of krepp's 128-entry nucleotide table. And a newline followed by `>` inside a sequence would open a *second* FASTA record in that reference's file, which krepp neither rejects nor notices: it folds every record in a reference's file into the same tree leaf, so the reference would silently carry k-mers from content no row claimed. Offending rows raise, naming the byte and its offset.
+- **A non-NULL `sequence2` raises.** A krepp reference is a single sequence; handed a paired-end relation, indexing only `sequence1` would build a plausible index from half the data and report `status = 'ok'`. The column may exist as long as every value is NULL — the same contract the aligners' subject tables use.
+- Fatal errors inside krepp — an out-of-range `k`, a malformed tree, an unreadable input — are reported as SQL errors carrying krepp's own message. Without that, krepp's `error_exit` is a `std::exit` that would take the DuckDB process down with no error at all.
+
+**Availability:** built when `MIINT_ENABLE_KREPP` is on, which excludes WASM and Windows. Check with `SELECT 1 FROM duckdb_functions() WHERE function_name = 'krepp_index_create';`.
 
 ### Resolve placements
 

@@ -450,6 +450,54 @@ fi
 # cost of leaving old indexes on disk; data/krepp/ is gitignored, so remove them
 # by hand when you care.
 KREPP_TOY_DIR=data/krepp
+
+# krepp's tutorial references, unpacked once.
+#
+# Hoisted out of the CLI-gated build below because krepp_index_create needs the
+# references and nothing else - it builds the index in-process, so its
+# round-trip test runs on a machine with no krepp binary at all. The CLI build
+# further down reuses what this unpacks.
+krepp_toy_ref_count() { ls "$KREPP_TOY_DIR"/references_toy/*.fna 2>/dev/null | wc -l | tr -d ' '; }
+if [ -n "$KREPP_AVAILABLE" ] && command -v xz &> /dev/null \
+   && [ -f ext/krepp/test/references_toy.tar.gz ] && [ -s ext/krepp/test/input_map.tsv ]; then
+    # How many there are supposed to be, from the corpus's own manifest, so a
+    # half-finished extraction is retried instead of being mistaken for a
+    # complete one by "at least one .fna exists".
+    #
+    # `grep -c` exits 1 when it counts zero lines and 2 when the file is
+    # missing. Here it is the whole right-hand side of an assignment, so set -e
+    # checks it and either would abort the entire test run. The `-s` test above
+    # rules both out; `|| true` is belt for whoever edits that gate next.
+    KREPP_TOY_WANT_REFS="$(grep -c . ext/krepp/test/input_map.tsv || true)"
+    if [ "$(krepp_toy_ref_count)" != "$KREPP_TOY_WANT_REFS" ]; then
+        mkdir -p "$KREPP_TOY_DIR"
+        # `|| true` is load-bearing. set -e exempts every command in an AND-OR
+        # list EXCEPT the last one, so the last is exactly the position it does
+        # check - and xz exits 1 if any member fails to decode. Without the
+        # trailing `|| true` that failure aborts the entire test run, every SQL
+        # and C++ test after this point, instead of skipping one optional test.
+        # The count check below is what decides whether the unpack worked.
+        tar -xzf ext/krepp/test/references_toy.tar.gz -C "$KREPP_TOY_DIR" \
+            && xz -df "$KREPP_TOY_DIR"/references_toy/*.fna.xz 2>/dev/null || true
+    fi
+    if [ "$(krepp_toy_ref_count)" = "$KREPP_TOY_WANT_REFS" ]; then
+        export MIINT_KREPP_TOY_REFS="$KREPP_TOY_DIR/references_toy"
+    else
+        echo "Warning: unpacked $(krepp_toy_ref_count) of $KREPP_TOY_WANT_REFS krepp toy references,"
+        echo "         so krepp_index_create's round-trip test is being skipped."
+    fi
+elif [ -n "$KREPP_AVAILABLE" ]; then
+    # Say which of the two it was. A silent skip here looks identical to a
+    # passing round-trip test.
+    if ! command -v xz &> /dev/null; then
+        echo "Note: xz not on PATH, so krepp's toy references cannot be unpacked and"
+        echo "      krepp_index_create's round-trip test is being skipped."
+    else
+        echo "Note: krepp's toy reference corpus (ext/krepp/test/references_toy.tar.gz"
+        echo "      and input_map.tsv) is missing or empty, so krepp_index_create's"
+        echo "      round-trip test is being skipped."
+    fi
+fi
 if [ -n "$KREPP_AVAILABLE" ] && command -v krepp &> /dev/null && command -v xz &> /dev/null; then
     # Every component is checked, because an empty one would silently match an
     # empty one on the other side and turn the pin into a no-op. Same reason
@@ -478,8 +526,7 @@ if [ -n "$KREPP_TOY_WANT" ]; then
     if [ ! -d "$KREPP_TOY_INDEX" ] && [ ! -d "$KREPP_TOY_PARTIAL" ]; then
         echo "Building krepp toy index (once per krepp version) ..."
         mkdir -p "$KREPP_TOY_DIR"
-        if tar -xzf ext/krepp/test/references_toy.tar.gz -C "$KREPP_TOY_DIR" \
-           && xz -df "$KREPP_TOY_DIR"/references_toy/*.fna.xz 2>/dev/null \
+        if [ -n "$MIINT_KREPP_TOY_REFS" ] \
            && awk -v d="$PWD/$KREPP_TOY_DIR" -F'\t' '{print $1 "\t" d "/references_toy/" $1 ".fna"}' \
                 ext/krepp/test/input_map.tsv > "$KREPP_TOY_DIR/input_map.tsv" \
            && krepp index -h 11 -k 27 -w 35 -o "$KREPP_TOY_PARTIAL" \
