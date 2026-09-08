@@ -259,7 +259,7 @@ Build the index [`place_krepp`](#phylogenetic-placement-krepp) reads, from relat
 
 **Function signature**:
 
-`krepp_index_create(sequence_table, output_path [, tree_table | newick_path, k, w, h, m, r, frac, sdust_t, sdust_w])`
+`krepp_index_create(sequence_table, output_path [, tree_table | newick_path, k, w, h, m, r, frac, sdust_t, sdust_w, threads])`
 
 **Parameters:**
 - `sequence_table` (VARCHAR, required, positional): Name of a table or view holding the reference sequences. Requires `read_id` and `sequence1` columns, the same contract as the aligners and [`save_bowtie2_index`](alignment_reference.md); `read_id` may be VARCHAR, BIGINT or UUID, as it may for `place_krepp`'s `query_table`.
@@ -275,6 +275,11 @@ Build the index [`place_krepp`](#phylogenetic-placement-krepp) reads, from relat
 - `h` (INTEGER, default *k* − 16): Number of LSH positions. krepp requires 9 ≤ *h* ≤ 15, and *h* ≥ *k* − 16.
 - `m` (INTEGER, default 4), `r` (INTEGER, default 1), `frac` (BOOLEAN, default true): Partitioning of the *k*-mer space, exactly as krepp's `--m`, `--r` and `--frac`. These decide the index's filename suffix (`-m4r1-frac`).
 - `sdust_t` (INTEGER, default 0), `sdust_w` (INTEGER, default 0): SDUST low-complexity masking threshold and window. Both 0 disables masking; krepp warns that enabling it makes its subsampling model slightly inaccurate.
+- `threads` (INTEGER, default 1, maximum 256): Threads krepp spreads the build over. Available only when the extension was built with an OpenMP runtime present — `SELECT * FROM miint_versions() WHERE library = 'krepp-openmp'` returns a row when it was. On a build without one, `threads := 1` is accepted and anything larger is **refused rather than clamped**, because a thread count that is quietly ignored is indistinguishable from a slow machine. The 256 ceiling is a guard rail, not a tuning limit: krepp passes the value to `omp_set_num_threads` unclamped, and when the runtime cannot create that many threads it aborts the process rather than failing the call.
+
+  Which files a threaded build changes: krepp merges each node's children in whatever order their tasks finish, so the colour arrays (`cmer`'s subset column, and `crecord`) differ between a serial and a threaded build. The *k*-mers indexed and the bucket each lands in do not — `inc-m4r1-frac` was byte-identical across 1 and 4 threads, and `total_num_kmers` was unchanged. Note that no two builds are byte-identical across *every* file regardless of thread count, because `metadata-*.txt` records a build timestamp. Placement output is not a clean comparison in either direction — `place_krepp` is not reproducible run to run even single-threaded, for reasons that predate this parameter and are unrelated to it; the variation observed was confined to `like_weight_ratio`, with `edge_num` and the distances stable.
+
+  Scaling is sublinear and flattens early. Measured through `krepp_index_create` on a ten-core Apple M1 Max over the 25-genome corpus in `ext/krepp/test`, one run per point: about 10.1 s at one thread, 5.0 s at four, 4.6 s at eight.
 
 **Output schema:** one row.
 - `output_path` (VARCHAR): The directory written.

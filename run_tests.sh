@@ -386,6 +386,23 @@ fi
 if echo "SELECT 1 FROM duckdb_functions() WHERE function_name = 'align_mafft';" | ./build/release/duckdb -csv -noheader 2>/dev/null | grep -q 1; then
     export MAFFT_AVAILABLE=1
 fi
+# krepp's index regions are only compiled in when an OpenMP runtime was found at
+# configure time; without them krepp_index_create refuses threads > 1. Both
+# branches are exported, because the refusal is worth asserting too - a build
+# that took the parameter and silently ran on one core is the failure this is
+# guarding against.
+# Unset first: these two are mutually exclusive assertions, not one availability
+# flag, so a value inherited from the caller's environment does not merely skip a
+# file - it runs the wrong one and fails it. Verified: KREPP_OPENMP_ABSENT=1
+# pre-set on an OpenMP build makes krepp_index_create_no_threads.test fail.
+unset KREPP_OPENMP_AVAILABLE KREPP_OPENMP_ABSENT
+if echo "SELECT * FROM miint_versions() WHERE library = 'krepp';" | ./build/release/duckdb -csv 2>/dev/null | grep -q krepp; then
+    if echo "SELECT * FROM miint_versions() WHERE library = 'krepp-openmp';" | ./build/release/duckdb -csv 2>/dev/null | grep -q krepp-openmp; then
+        export KREPP_OPENMP_AVAILABLE=1
+    else
+        export KREPP_OPENMP_ABSENT=1
+    fi
+fi
 if echo "SELECT 1 FROM duckdb_functions() WHERE function_name = 'align_abpoa';" | ./build/release/duckdb -csv 2>/dev/null | grep -q 1; then
     export ABPOA_AVAILABLE=1
 fi

@@ -287,7 +287,7 @@ starts with '>' or '@'
 statement error
 SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_neg_m', tree_table := 'backbone', m := -1);
 ----
-m must be between 0 and
+m must not be negative
 
 # Zero is the one that matters. krepp's CLI bounds -m with PositiveNumber, but
 # validate_configuration - the only check the library path runs - looks at w, h
@@ -300,6 +300,37 @@ statement error
 SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_zero_m', tree_table := 'backbone', m := 0);
 ----
 m must be at least 1
+
+# threads is bounded the same way and for a plainer reason: krepp's
+# set_num_threads clamps 0 to 1 rather than passing it to omp_set_num_threads,
+# which is only defined for positive counts. Refusing here means the caller
+# learns the number was wrong instead of silently getting a different one.
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_zero_threads', tree_table := 'backbone', threads := 0);
+----
+threads must be at least 1
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_neg_threads', tree_table := 'backbone', threads := -1);
+----
+threads must not be negative
+
+# An unbounded thread count does not fail the query, it kills the server:
+# krepp passes the value to omp_set_num_threads unclamped, and libomp calls
+# abort() when it cannot create that many threads. Measured before the cap
+# existed: threads := 10000 took the whole DuckDB process down with SIGABRT and
+# no SQL error. 257 is the first value the cap rejects; 256 is accepted and is
+# covered by reaching a later check in krepp_index_create_threads.test.
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_over_threads', tree_table := 'backbone', threads := 257);
+----
+threads must be at most 256
+
+statement error
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/idx_huge_threads', tree_table := 'backbone', threads := 100000);
+----
+threads must be at most 256
 
 # '@' is the other byte krepp's input sniffer reads as "this is a FASTQ, not a
 # reference map" - the same hazard as '>' and just as reachable, since reference

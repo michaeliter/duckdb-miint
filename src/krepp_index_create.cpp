@@ -35,6 +35,10 @@ namespace {
 
 constexpr const char *kCallerName = "krepp_index_create";
 
+// Upper bound for the `threads` parameter. See the check in the binder for
+// what goes wrong without one and how this number was chosen.
+constexpr uint32_t kMaxThreads = 256;
+
 // The characters NewickTree::to_newick quotes a label for. A reference name
 // carrying any of them would reach krepp quoted in the tree and bare in the
 // input map, and krepp matches the two by string equality - so the reference
@@ -223,8 +227,20 @@ uint32_t ReadUIntParam(const named_parameter_map_t &params, const char *key, uin
 		return fallback;
 	}
 	const int64_t value = it->second.GetValue<int64_t>();
-	if (value < 0 || value > static_cast<int64_t>(UINT32_MAX)) {
-		throw BinderException("%s: %s must be between 0 and %u (got %lld)", kCallerName, std::string(key), UINT32_MAX,
+	// Every caller declares its parameter as LogicalType::INTEGER, so DuckDB has
+	// already cast to INT32 and rejected anything outside that before Bind runs:
+	// `threads := 2147483648` arrives as an Invalid Input Error from the cast and
+	// never reaches here. A negative value does reach here, though, because INT32
+	// holds it. The old message named 0..UINT32_MAX, advertising a ceiling this
+	// function cannot actually be handed.
+	if (value < 0) {
+		throw BinderException("%s: %s must not be negative (got %lld)", kCallerName, std::string(key),
+		                      static_cast<long long>(value));
+	}
+	if (value > static_cast<int64_t>(UINT32_MAX)) {
+		// Unreachable while every caller is INTEGER. Kept so that declaring one
+		// BIGINT later truncates loudly instead of silently wrapping.
+		throw BinderException("%s: %s must be at most %u (got %lld)", kCallerName, std::string(key), UINT32_MAX,
 		                      static_cast<long long>(value));
 	}
 	return static_cast<uint32_t>(value);
@@ -331,6 +347,35 @@ unique_ptr<FunctionData> KreppIndexCreateTableFunction::Bind(ClientContext &cont
 		throw BinderException("%s: m must be at least 1 (got %u); krepp partitions the LSH space modulo m and "
 		                      "divides by it",
 		                      kCallerName, data->options.m);
+	}
+	data->options.threads = ReadUIntParam(input.named_parameters, "threads", data->options.threads);
+	if (data->options.threads < 1) {
+		throw BinderException("%s: threads must be at least 1 (got %u)", kCallerName, data->options.threads);
+	}
+	// Refused rather than clamped: a build with krepp's OpenMP regions compiled
+	// out would take the number, run on one core anyway, and report success -
+	// and the only way to tell would be the wall clock.
+	// Nothing else bounds `threads` from above: set_num_threads does not clamp
+	// (ext/krepp/src/common.cpp:28) and neither does krepp's CLI, so the value
+	// reaches omp_set_num_threads unchanged. libomp does not fail that call when
+	// it cannot create the threads - it calls abort(), taking the whole DuckDB
+	// process down with no SQL error and no chance to catch it:
+	//   OMP: Error #34: System unable to allocate necessary resources for OMP thread
+	// The ceiling is not a fixed property of the machine. Measured here: a bare
+	// process built a team of 8192 and aborted at 16384, while inside DuckDB -
+	// whose own pool has already taken threads - 1000 succeeded and 10000
+	// aborted. So this is a guard rail set far below the lowest abort seen
+	// anywhere, not a tuned value; no index build benefits from oversubscribing
+	// this hard, and a query must not be able to kill the server.
+	if (data->options.threads > kMaxThreads) {
+		throw BinderException("%s: threads must be at most %u (got %u)", kCallerName, kMaxThreads,
+		                      data->options.threads);
+	}
+	if (data->options.threads > 1 && !miint::KreppIndexThreadsSupported()) {
+		throw BinderException("%s: threads := %u needs an OpenMP runtime and this build has none, so krepp's "
+		                      "index regions were compiled out. Rebuild with libomp available (brew install "
+		                      "libomp, or -DMIINT_LIBOMP_PREFIX=/prefix), or pass threads := 1",
+		                      kCallerName, data->options.threads);
 	}
 	data->options.sdust_t = ReadUIntParam(input.named_parameters, "sdust_t", data->options.sdust_t);
 	data->options.sdust_w = ReadUIntParam(input.named_parameters, "sdust_w", data->options.sdust_w);
@@ -620,6 +665,7 @@ TableFunction KreppIndexCreateTableFunction::GetFunction() {
 	tf.named_parameters["m"] = LogicalType::INTEGER;
 	tf.named_parameters["r"] = LogicalType::INTEGER;
 	tf.named_parameters["frac"] = LogicalType::BOOLEAN;
+	tf.named_parameters["threads"] = LogicalType::INTEGER;
 	tf.named_parameters["sdust_t"] = LogicalType::INTEGER;
 	tf.named_parameters["sdust_w"] = LogicalType::INTEGER;
 	return tf;

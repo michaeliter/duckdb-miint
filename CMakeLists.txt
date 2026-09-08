@@ -183,7 +183,14 @@ endif()
 #
 # Exposes a single INTERFACE target `miint_openmp` so link sites below
 # don't need to know which platform-specific dance produced it.
-if(MIINT_ENABLE_UNIFRAC AND NOT EMSCRIPTEN)
+#
+# krepp wants it too, to build indexes on more than one core. Unlike UniFrac it
+# can do without: compiled with _WOPENMP=0 its pragmas are ignored and the build
+# stays serial, which is what every release before this did. So a missing
+# runtime is fatal only when UniFrac is the one asking, and MIINT_OPENMP_AVAILABLE
+# is what the krepp block below consults.
+if((MIINT_ENABLE_UNIFRAC OR MIINT_ENABLE_KREPP) AND NOT EMSCRIPTEN)
+    set(MIINT_OPENMP_AVAILABLE ON)
     if(APPLE)
         # Opt-in override for hosts without Homebrew: point at a prefix holding
         # include/omp.h + lib/libomp.{a,dylib} (e.g. a conda env's $CONDA_PREFIX).
@@ -197,8 +204,17 @@ if(MIINT_ENABLE_UNIFRAC AND NOT EMSCRIPTEN)
         # set" check, mirroring how OpenMP::OpenMP_CXX itself behaves.
         add_library(miint_openmp INTERFACE IMPORTED GLOBAL)
         if(MIINT_LIBOMP_PREFIX)
+            # MIINT_LIBOMP_PREFIX is a cache entry, so it outlives the configure
+            # that set it. Now that krepp enters this block too, a prefix that has
+            # since gone stale must not abort a build that never asked for one -
+            # only UniFrac, which cannot proceed without it, still fails.
             if(NOT EXISTS "${MIINT_LIBOMP_PREFIX}/include/omp.h")
-                message(FATAL_ERROR "MIINT_LIBOMP_PREFIX='${MIINT_LIBOMP_PREFIX}' has no include/omp.h")
+                if(MIINT_ENABLE_UNIFRAC)
+                    message(FATAL_ERROR "MIINT_LIBOMP_PREFIX='${MIINT_LIBOMP_PREFIX}' has no include/omp.h")
+                endif()
+                message(STATUS "MIINT_LIBOMP_PREFIX='${MIINT_LIBOMP_PREFIX}' has no include/omp.h - "
+                               "krepp index builds stay single-threaded.")
+                set(MIINT_OPENMP_AVAILABLE OFF)
             endif()
             # Also consumed below by the skbb/unifrac inmem sub-makes' INMEM_MPFLAG.
             set(MIINT_LIBOMP_INCLUDE_DIR "${MIINT_LIBOMP_PREFIX}/include")
@@ -220,8 +236,13 @@ if(MIINT_ENABLE_UNIFRAC AND NOT EMSCRIPTEN)
                 set_property(TARGET miint_openmp PROPERTY
                     INTERFACE_LINK_OPTIONS "-Wl,-rpath,${MIINT_LIBOMP_PREFIX}/lib")
             else()
-                message(FATAL_ERROR
-                    "MIINT_LIBOMP_PREFIX='${MIINT_LIBOMP_PREFIX}' has neither lib/libomp.a nor lib/libomp.dylib")
+                if(MIINT_ENABLE_UNIFRAC)
+                    message(FATAL_ERROR
+                        "MIINT_LIBOMP_PREFIX='${MIINT_LIBOMP_PREFIX}' has neither lib/libomp.a nor lib/libomp.dylib")
+                endif()
+                message(STATUS "MIINT_LIBOMP_PREFIX='${MIINT_LIBOMP_PREFIX}' has no libomp library - "
+                               "krepp index builds stay single-threaded.")
+                set(MIINT_OPENMP_AVAILABLE OFF)
             endif()
         else()
             # Default: probe Homebrew for a STATIC libomp.a (the CI path, unchanged).
@@ -242,29 +263,45 @@ if(MIINT_ENABLE_UNIFRAC AND NOT EMSCRIPTEN)
                     break()
                 endif()
             endforeach()
-            if(NOT MIINT_LIBOMP_FOUND_PREFIX)
+            if(NOT MIINT_LIBOMP_FOUND_PREFIX AND MIINT_ENABLE_UNIFRAC)
                 message(FATAL_ERROR
                     "OpenMP static archive (libomp.a) not found on macOS.\n"
                     "  Install with: brew install libomp\n"
                     "  Or set -DMIINT_LIBOMP_PREFIX=/prefix (include/omp.h + lib/libomp.{a,dylib}).\n"
                     "  Required when MIINT_ENABLE_UNIFRAC=ON.")
+            elseif(NOT MIINT_LIBOMP_FOUND_PREFIX)
+                message(STATUS
+                    "No libomp on macOS - krepp index builds stay single-threaded. "
+                    "brew install libomp, or -DMIINT_LIBOMP_PREFIX=/prefix, to build them on more than one core.")
+                set(MIINT_OPENMP_AVAILABLE OFF)
             endif()
-            message(STATUS "Found Homebrew libomp at: ${MIINT_LIBOMP_FOUND_PREFIX}")
-            # Also consumed below by the skbb/unifrac inmem sub-makes' INMEM_MPFLAG.
-            set(MIINT_LIBOMP_INCLUDE_DIR "${MIINT_LIBOMP_FOUND_PREFIX}/include")
-            set_property(TARGET miint_openmp PROPERTY
-                INTERFACE_INCLUDE_DIRECTORIES "${MIINT_LIBOMP_INCLUDE_DIR}")
-            # Positional .a (not -lomp): Homebrew ships both libomp.a and
-            # libomp.dylib; -lomp prefers the dylib, baking a Homebrew path
-            # into the extension's RPATH.
-            set_property(TARGET miint_openmp PROPERTY
-                INTERFACE_LINK_LIBRARIES "${MIINT_LIBOMP_FOUND_PREFIX}/lib/libomp.a")
+            if(MIINT_OPENMP_AVAILABLE)
+                message(STATUS "Found Homebrew libomp at: ${MIINT_LIBOMP_FOUND_PREFIX}")
+                # Also consumed below by the skbb/unifrac inmem sub-makes' INMEM_MPFLAG.
+                set(MIINT_LIBOMP_INCLUDE_DIR "${MIINT_LIBOMP_FOUND_PREFIX}/include")
+                set_property(TARGET miint_openmp PROPERTY
+                    INTERFACE_INCLUDE_DIRECTORIES "${MIINT_LIBOMP_INCLUDE_DIR}")
+                # Positional .a (not -lomp): Homebrew ships both libomp.a and
+                # libomp.dylib; -lomp prefers the dylib, baking a Homebrew path
+                # into the extension's RPATH.
+                set_property(TARGET miint_openmp PROPERTY
+                    INTERFACE_LINK_LIBRARIES "${MIINT_LIBOMP_FOUND_PREFIX}/lib/libomp.a")
+            endif()
         endif()
     else()
-        find_package(OpenMP REQUIRED COMPONENTS CXX)
-        add_library(miint_openmp INTERFACE IMPORTED GLOBAL)
-        set_property(TARGET miint_openmp PROPERTY
-            INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_CXX)
+        if(MIINT_ENABLE_UNIFRAC)
+            find_package(OpenMP REQUIRED COMPONENTS CXX)
+        else()
+            find_package(OpenMP QUIET COMPONENTS CXX)
+        endif()
+        if(OpenMP_CXX_FOUND)
+            add_library(miint_openmp INTERFACE IMPORTED GLOBAL)
+            set_property(TARGET miint_openmp PROPERTY
+                INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_CXX)
+        else()
+            message(STATUS "OpenMP not found - krepp index builds stay single-threaded.")
+            set(MIINT_OPENMP_AVAILABLE OFF)
+        endif()
     endif()
 endif()
 
@@ -1313,8 +1350,59 @@ if(MIINT_ENABLE_KREPP)
     # target_link_libraries(x krepp) anywhere would re-arm exactly the trap the
     # comment above describes, and put krepp's kseq.h/kvec.h ahead of
     # minimap2's for that target.
-    target_compile_definitions(krepp PRIVATE _WOPENMP=0 _WLCURL=0
+    # krepp gates every OpenMP region on `defined(_OPENMP) && _WOPENMP == 1`, so
+    # the define is only half of it: the compile flag has to actually turn OpenMP
+    # on. Verified rather than assumed, because if it silently did not,
+    # krepp_index_create would advertise the feature, accept a thread count, and
+    # still build on one core.
+    set(MIINT_KREPP_OPENMP_OK OFF)
+    if(MIINT_OPENMP_AVAILABLE)
+        if(APPLE)
+            set(MIINT_KREPP_OPENMP_FLAG -Xpreprocessor -fopenmp)
+        else()
+            set(MIINT_KREPP_OPENMP_FLAG ${OpenMP_CXX_FLAGS})
+        endif()
+        include(CheckCXXSourceCompiles)
+        set(MIINT_SAVED_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS}")
+        string(REPLACE ";" " " CMAKE_REQUIRED_FLAGS "${MIINT_KREPP_OPENMP_FLAG}")
+        check_cxx_source_compiles(
+            "#ifndef _OPENMP\n#error OpenMP is not enabled\n#endif\nint main() { return 0; }"
+            MIINT_KREPP_OPENMP_FLAG_DEFINES_OPENMP)
+        set(CMAKE_REQUIRED_FLAGS "${MIINT_SAVED_REQUIRED_FLAGS}")
+        if(MIINT_KREPP_OPENMP_FLAG_DEFINES_OPENMP)
+            set(MIINT_KREPP_OPENMP_OK ON)
+        else()
+            message(STATUS "OpenMP flag does not define _OPENMP - krepp index builds stay single-threaded.")
+        endif()
+    endif()
+    # _WOPENMP feeds both the archive and the two miint TUs that include krepp's
+    # headers. In those headers it gates only `#include \"omp.h\"` - none of them
+    # declares an omp type or holds a pragma - so a mismatch would be a
+    # preprocessor inconsistency, not an ABI one. One variable regardless, since
+    # the same value decides MIINT_KREPP_OPENMP below.
+    if(MIINT_KREPP_OPENMP_OK)
+        set(MIINT_KREPP_WOPENMP 1)
+    else()
+        set(MIINT_KREPP_WOPENMP 0)
+    endif()
+    target_compile_definitions(krepp PRIVATE _WOPENMP=${MIINT_KREPP_WOPENMP} _WLCURL=0
         seq_nt4_table=krepp_seq_nt4_table)
+    if(MIINT_KREPP_OPENMP_OK)
+        # Apple Clang rejects a bare -fopenmp and wants the preprocessor form,
+        # with libomp linked separately - the same choice the skbb/unifrac
+        # sub-makes make for INMEM_MPFLAG above. Off Darwin the flag arrives with
+        # OpenMP::OpenMP_CXX's interface compile options through the link below,
+        # so it is not repeated here: FindOpenMP spells some candidates with a
+        # space ("-Xclang -fopenmp"), and target_compile_options would pass that
+        # as a single shell-quoted argument.
+        if(APPLE)
+            target_compile_options(krepp PRIVATE ${MIINT_KREPP_OPENMP_FLAG})
+        endif()
+        # For omp.h on the include path. The runtime itself is linked at each
+        # extension target, because those link krepp by archive path rather than
+        # by target name and so inherit nothing from here.
+        target_link_libraries(krepp PRIVATE miint_openmp)
+    endif()
     target_include_directories(krepp PRIVATE
         ${KREPP_DIR}/src ${PHMAP_INCLUDE_DIR} ${BOOST_MATH_INCLUDE_DIR})
     # PUBLIC here, unlike the two above, is deliberate: zlib is a real link
@@ -1358,7 +1446,8 @@ if(MIINT_ENABLE_KREPP)
     # Source-file properties are directory-scoped, so this reaches
     # miint_extension, miint_loadable_extension and tests alike.
     set_source_files_properties(src/KreppPlacer.cpp src/KreppIndexBuilder.cpp PROPERTIES
-        COMPILE_DEFINITIONS "_WOPENMP=0;_WLCURL=0;seq_nt4_table=krepp_seq_nt4_table")
+        COMPILE_DEFINITIONS
+            "_WOPENMP=${MIINT_KREPP_WOPENMP};_WLCURL=0;seq_nt4_table=krepp_seq_nt4_table;MIINT_KREPP_OPENMP=${MIINT_KREPP_WOPENMP}")
 endif()
 if(MIINT_ENABLE_VSEARCH)
     include_directories(${VSEARCH_SRC_DIR}/src)
@@ -1840,6 +1929,9 @@ if(MIINT_ENABLE_KREPP)
     # outside it. Same treatment as abpoa above.
     target_link_libraries(${EXTENSION_NAME} $<TARGET_FILE:krepp>)
     add_dependencies(${EXTENSION_NAME} krepp)
+    if(MIINT_KREPP_OPENMP_OK AND NOT MIINT_ENABLE_UNIFRAC)
+        target_link_libraries(${EXTENSION_NAME} miint_openmp)
+    endif()
 endif()
 if(MIINT_ENABLE_VSEARCH)
     target_link_libraries(${EXTENSION_NAME} vsearch)
@@ -1949,6 +2041,9 @@ if(MIINT_ENABLE_KREPP)
         KREPP_GIT_VERSION="${KREPP_GIT_VERSION}")
     target_link_libraries(${LOADABLE_EXTENSION_NAME} $<TARGET_FILE:krepp>)
     add_dependencies(${LOADABLE_EXTENSION_NAME} krepp)
+    if(MIINT_KREPP_OPENMP_OK AND NOT MIINT_ENABLE_UNIFRAC)
+        target_link_libraries(${LOADABLE_EXTENSION_NAME} miint_openmp)
+    endif()
 endif()
 if(MIINT_ENABLE_SYLPH)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MIINT_HAS_SYLPH
@@ -2201,7 +2296,8 @@ if(MIINT_ENABLE_VSEARCH)
         src/VsearchClusterWrapper.cpp test/cpp/test_VsearchClusterWrapper.cpp)
 endif()
 if(MIINT_ENABLE_KREPP)
-    list(APPEND TEST_SOURCES src/KreppPlacer.cpp test/cpp/test_KreppPlacer.cpp)
+    list(APPEND TEST_SOURCES src/KreppPlacer.cpp test/cpp/test_KreppPlacer.cpp
+        src/KreppIndexBuilder.cpp test/cpp/test_KreppIndexBuilder.cpp)
 endif()
 if(MIINT_ENABLE_MAFFT)
     list(APPEND TEST_SOURCES src/MafftAligner.cpp test/cpp/test_MafftAligner.cpp)
@@ -2301,6 +2397,9 @@ if(MIINT_ENABLE_KREPP)
         KREPP_GIT_VERSION="${KREPP_GIT_VERSION}")
     target_link_libraries(tests $<TARGET_FILE:krepp>)
     add_dependencies(tests krepp)
+    if(MIINT_KREPP_OPENMP_OK AND NOT MIINT_ENABLE_UNIFRAC)
+        target_link_libraries(tests miint_openmp)
+    endif()
 endif()
 if(MIINT_ENABLE_SYLPH)
     # Link rype (the umbrella archive), which transitively provides sylph

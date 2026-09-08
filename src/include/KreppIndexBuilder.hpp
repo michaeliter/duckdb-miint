@@ -25,10 +25,18 @@
  * ======
  * krepp reports fatal errors with error_exit, which is std::exit - a malformed
  * tree would take the DuckDB process down with no SQL error at all.
- * InstallKreppErrorHandler redirects those into KreppFatalError. It is safe
- * here because this build compiles krepp without -fopenmp (CMakeLists.txt sets
- * _WOPENMP=0 and adds no flag), so krepp's `#pragma omp` directives are ignored
- * and an exception never unwinds out of a structured block.
+ * InstallKreppErrorHandler redirects those into KreppFatalError.
+ *
+ * A throwing handler is only sound because krepp catches at the boundary of
+ * every OpenMP region in its index build path and rethrows on the calling
+ * thread (bo1929/krepp#14). Before that an exception could not leave a
+ * structured block at all, so this build had to compile krepp with _WOPENMP=0
+ * to stay correct - which is why there was no thread count to offer.
+ *
+ * That guarantee is scoped to the BUILD. krepp's index load path still has
+ * unguarded critical regions, and KreppPlacer calls into it. The throws
+ * reachable there are allocation failures rather than bad input, but an
+ * error_exit raised inside one would still terminate the process.
  */
 
 #include <cstdint>
@@ -79,15 +87,23 @@ struct KreppIndexOptions {
 	bool frac = true;
 	uint32_t sdust_t = 0;
 	uint32_t sdust_w = 0;
+	// 1 is what every release before this did. Above 1 only does anything when
+	// krepp was compiled with its OpenMP regions in - ask
+	// KreppIndexThreadsSupported() rather than assuming.
+	uint32_t threads = 1;
 };
+
+// Whether a `threads` above 1 can do anything: true when krepp was built with
+// an OpenMP runtime available. A build without one takes threads = 1 and
+// refuses more, rather than accepting a thread count and quietly ignoring it.
+bool KreppIndexThreadsSupported();
 
 // Build the index. Runs krepp's own index pipeline in the order krepp's main
 // runs it, and writes the same files to `index_dir`.
 //
 // Throws KreppFatalError for anything krepp itself rejects - an unreadable
-// input, a malformed tree, an out-of-range parameter. Single-threaded: krepp's
-// num_threads global is only ever assigned by its CLI layer, and this build has
-// no OpenMP regardless.
+// input, a malformed tree, an out-of-range parameter. Runs on
+// options.threads threads.
 void BuildKreppIndex(const KreppIndexOptions &options);
 
 } // namespace miint
