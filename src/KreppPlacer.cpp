@@ -4,6 +4,7 @@
 #include "alignment_functions_internal.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -66,6 +67,28 @@ std::map<std::string, std::set<std::string>> DiscoverPartials(const std::string 
 } // namespace
 
 namespace krepp_detail {
+
+std::string PartialHashConfig(const std::string &suffix) {
+	// "-m<M>r<R><rest>" -> "-m<M><rest>". Anything else is returned unchanged.
+	if (suffix.size() < 2 || suffix[0] != '-' || suffix[1] != 'm') {
+		return suffix;
+	}
+	size_t i = 2;
+	while (i < suffix.size() && std::isdigit(static_cast<unsigned char>(suffix[i]))) {
+		i++;
+	}
+	if (i == 2 || i >= suffix.size() || suffix[i] != 'r') {
+		return suffix;
+	}
+	const size_t r_begin = i++;
+	while (i < suffix.size() && std::isdigit(static_cast<unsigned char>(suffix[i]))) {
+		i++;
+	}
+	if (i == r_begin + 1) {
+		return suffix; // an 'r' with no digits after it is not a residue
+	}
+	return suffix.substr(0, r_begin) + suffix.substr(i);
+}
 
 // U and u are accepted only because place() rewrites them to T and t before
 // krepp sees them; krepp's own table maps them to the ambiguous code, so an RNA
@@ -142,6 +165,46 @@ void ValidateNewickLexically(const std::string &newick_text, const std::string &
 	}
 }
 
+bool ReadPartialKWH(const std::string &path, int32_t &k, int32_t &w, int32_t &h) {
+	std::ifstream in(path);
+	if (!in) {
+		return false;
+	}
+	int32_t *const targets[3] = {&k, &w, &h};
+	const char *const keys[3] = {"k", "w", "h"};
+	bool found[3] = {false, false, false};
+	std::string line;
+	while (std::getline(in, line)) {
+		const size_t colon = line.find(':');
+		if (colon == std::string::npos) {
+			continue;
+		}
+		const std::string key = line.substr(0, colon);
+		std::string value = line.substr(colon + 1);
+		while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+			value.erase(value.begin());
+		}
+		for (size_t i = 0; i < 3; i++) {
+			if (key != keys[i]) {
+				continue;
+			}
+			try {
+				*targets[i] = std::stoi(value);
+				found[i] = true;
+			} catch (const std::exception &) {
+				// Left false; the loop below turns it into an error.
+			}
+		}
+	}
+	for (size_t i = 0; i < 3; i++) {
+		if (!found[i]) {
+			throw std::runtime_error("krepp metadata " + path + " has no readable '" + std::string(keys[i]) +
+			                         "' field; krepp's metadata format has changed");
+		}
+	}
+	return true;
+}
+
 std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::string &index_dir) {
 	// `ec` is reported rather than discarded, but only when it says something
 	// new: is_directory returns false both for "not there" and for "there but
@@ -175,20 +238,24 @@ std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::stri
 			                         " is missing one or more files");
 		}
 	}
-	// Several partials of one index are normal, and krepp loads them all. Two
-	// *different* indexes in one directory are not: `krepp index` never clears
-	// what is already there, so re-indexing with new parameters leaves both
-	// behind. krepp discovers that only inside Index::check_compatible, which
-	// reports it with error_exit (index.cpp:24, :46, :84) and takes the process
-	// with it. It is decidable here, from the filenames, before anything opens.
+	// Several partials of one index are normal, and krepp loads them all
+	// (ext/krepp/src/krepp.cpp:43-77 collects every distinct suffix and calls
+	// load_partial_index on each). Two *different* indexes in one directory are
+	// not: `krepp index` never clears what is already there, so re-indexing with
+	// new parameters leaves both behind. krepp discovers that only inside
+	// Index::check_compatible, which reports it with error_exit (index.cpp:26,
+	// :47, :86). InstallKreppErrorHandler turns that into an exception rather
+	// than a std::exit, so it surfaces as a DuckDB error - but only after the
+	// files have been opened and read. It is decidable here, from the filenames,
+	// before anything opens.
 	//
-	// The suffix splits the way krepp splits it (krepp.cpp:81-83): `-m4r1` is
-	// the hash configuration and must agree across partials; the remainder
-	// distinguishes one partial from another and is expected to differ.
+	// What has to agree is the hash configuration, NOT the whole suffix - see
+	// PartialHashConfig. An earlier version keyed on `-m4r1`, which folded the
+	// residue into the identity and so rejected the ordinary multi-partial
+	// layout: three residues of one index read as three different indexes.
 	std::set<std::string> hash_configs;
 	for (const auto &entry : partials) {
-		const size_t second = entry.first.find('-', 1);
-		hash_configs.insert(second == std::string::npos ? entry.first : entry.first.substr(0, second));
+		hash_configs.insert(PartialHashConfig(entry.first));
 	}
 	if (hash_configs.size() > 1) {
 		std::string listed;
@@ -200,6 +267,40 @@ std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::stri
 		                         "configurations (" +
 		                         listed +
 		                         "); krepp would try to load them as one index. Keep one index per directory.");
+	}
+
+	// k, w and h are in no filename, so two builds that differ in them are
+	// indistinguishable above. That matters in both directions. krepp catches k
+	// and h itself inside LSHF::check_compatible, but only once the files are
+	// open - and it never compares w at all (ext/krepp/src/lshf.cpp:159-163),
+	// reading it into a local it discards (index.cpp:59-63), so a differing w is
+	// caught nowhere and simply leaves one index holding two different sets of
+	// minimizers. Compare all three here, from the sidecar metadata, before
+	// anything is loaded.
+	const std::string *named = nullptr;
+	int32_t first_k = 0, first_w = 0, first_h = 0;
+	for (const auto &entry : partials) {
+		int32_t k = 0, w = 0, h = 0;
+		// Absent sidecar: skipped, not rejected - krepp synthesises it when it
+		// is missing, so a partial without one is still a valid partial.
+		if (!ReadPartialKWH(index_dir + "/metadata" + entry.first + ".txt", k, w, h)) {
+			continue;
+		}
+		if (named == nullptr) {
+			named = &entry.first;
+			first_k = k;
+			first_w = w;
+			first_h = h;
+			continue;
+		}
+		if (k == first_k && w == first_w && h == first_h) {
+			continue;
+		}
+		throw std::runtime_error("Directory " + index_dir + " holds partials that disagree on k, w or h: '" + *named +
+		                         "' has k=" + std::to_string(first_k) + " w=" + std::to_string(first_w) + " h=" +
+		                         std::to_string(first_h) + ", '" + entry.first + "' has k=" + std::to_string(k) +
+		                         " w=" + std::to_string(w) + " h=" + std::to_string(h) +
+		                         ". Partials of one index must agree on all three; these are two different indexes.");
 	}
 	return partials;
 }

@@ -250,45 +250,23 @@ uint32_t ReadUIntParam(const named_parameter_map_t &params, const char *key, uin
 // pieces. Read back rather than recomputed so the row reports the index that
 // exists on disk, including the w and h krepp derived from k when they were
 // not given.
+//
+// The parse itself lives in krepp_detail because ValidateIndexLayout needs the
+// same three fields to check that partials agree. The contracts differ only in
+// what a missing file means: there it is legal (krepp synthesises the sidecar),
+// here krepp has just written the index so its absence is a real failure.
 void ReadIndexMetadata(const std::string &path, int32_t &k, int32_t &w, int32_t &h) {
-	std::ifstream in(path);
-	if (!in) {
+	bool present = false;
+	try {
+		present = miint::krepp_detail::ReadPartialKWH(path, k, w, h);
+	} catch (const std::exception &e) {
+		// Fail rather than report zeros next to status='ok'. These three columns
+		// are the only way a caller learns what w and h krepp derived, so a
+		// silent 0 would be a wrong answer wearing a success badge.
+		throw IOException("%s: index built, but %s", kCallerName, std::string(e.what()));
+	}
+	if (!present) {
 		throw IOException("%s: index built but its metadata '%s' could not be read", kCallerName, path);
-	}
-	int32_t *const targets[3] = {&k, &w, &h};
-	const char *const keys[3] = {"k", "w", "h"};
-	bool found[3] = {false, false, false};
-	std::string line;
-	while (std::getline(in, line)) {
-		const size_t colon = line.find(':');
-		if (colon == std::string::npos) {
-			continue;
-		}
-		const std::string key = line.substr(0, colon);
-		std::string value = line.substr(colon + 1);
-		StringUtil::Trim(value);
-		for (size_t i = 0; i < 3; i++) {
-			if (key != keys[i]) {
-				continue;
-			}
-			try {
-				*targets[i] = std::stoi(value);
-				found[i] = true;
-			} catch (const std::exception &) {
-				// Leave found[i] false; the check below turns it into an error.
-			}
-		}
-	}
-	// Fail rather than report zeros next to status='ok'. These three columns are
-	// the only way a caller learns what w and h krepp derived, so a silent 0
-	// would be a wrong answer wearing a success badge - and the only way to get
-	// here is krepp changing the format of a file it just wrote.
-	for (size_t i = 0; i < 3; i++) {
-		if (!found[i]) {
-			throw IOException("%s: index built, but its metadata '%s' has no readable '%s' field; krepp's metadata "
-			                  "format has changed",
-			                  kCallerName, path, std::string(keys[i]));
-		}
 	}
 }
 
@@ -395,24 +373,123 @@ unique_ptr<FunctionData> KreppIndexCreateTableFunction::Bind(ClientContext &cont
 	return std::move(data);
 }
 
+// The filename suffix krepp will give every file this build writes. Mirrors
+// the IndexMultiple constructor (ext/krepp/src/index.cpp:249-251) exactly; if that
+// ever changes, PartialHashConfig's parse and this have to move together.
+std::string PartialSuffixFor(const miint::KreppIndexOptions &options) {
+	return "-m" + std::to_string(options.m) + "r" + std::to_string(options.r) + (options.frac ? "-frac" : "-no_frac");
+}
+
+// Decide whether `output_path` is somewhere this build may write.
+//
+// Absent or empty: yes. Already holding partials of the SAME index at a
+// different residue: yes - that is the multi-partial build, and adding to it is
+// the point. Holding a different index, this exact residue, or debris: no, and
+// we neither delete nor overwrite any of it.
+void CheckOutputPathAcceptsPartial(const KreppIndexCreateTableFunction::Data &data) {
+	std::error_code ec;
+	if (!std::filesystem::exists(data.output_path, ec)) {
+		return;
+	}
+	// is_directory before is_empty: is_empty() answers "size == 0" for a regular
+	// file, so an empty file here would return early as though it were an empty
+	// directory, and the mistake would only surface much later inside krepp's
+	// create_directory - after the temporary FASTAs had already been written.
+	if (!std::filesystem::is_directory(data.output_path, ec)) {
+		throw IOException("%s: output_path '%s' exists and is not a directory", kCallerName, data.output_path);
+	}
+	if (std::filesystem::is_empty(std::filesystem::path(data.output_path), ec)) {
+		return;
+	}
+
+	std::map<std::string, std::set<std::string>> existing;
+	try {
+		existing = miint::krepp_detail::ValidateIndexLayout(data.output_path);
+	} catch (const std::exception &e) {
+		// Debris from a build that died partway, an unrelated file, or two
+		// indexes already mixed together. None of those is a directory to add a
+		// partial to, and none of them is ours to clean up.
+		throw IOException("%s: output_path '%s' is not empty and does not hold one complete krepp index for this "
+		                  "build to add a partial to (%s). krepp writes alongside whatever is already there, so "
+		                  "building here would leave a mixed directory - remove it or choose another path",
+		                  kCallerName, data.output_path, std::string(e.what()));
+	}
+
+	const std::string ours = PartialSuffixFor(data.options);
+	if (existing.find(ours) != existing.end()) {
+		throw IOException("%s: output_path '%s' already holds the partial this build would write ('%s'). krepp does "
+		                  "not clear what is there, so this would write over it. Use a different r, or another path",
+		                  kCallerName, data.output_path, ours);
+	}
+	const std::string our_config = miint::krepp_detail::PartialHashConfig(ours);
+	const std::string their_config = miint::krepp_detail::PartialHashConfig(existing.begin()->first);
+	if (our_config != their_config) {
+		throw IOException("%s: output_path '%s' holds an index built with a different hash configuration "
+		                  "('%s' vs this build's '%s'); krepp would load them as one index and reject them. "
+		                  "Partials of one index must share m and frac, and differ only in r",
+		                  kCallerName, data.output_path, their_config.substr(1), our_config.substr(1));
+	}
+
+	// m and frac are in the filename; k, w and h are not, and they decide which
+	// k-mers get indexed and where the LSH positions land. Compare them against
+	// a partial that is already there.
+	//
+	// Compare the EFFECTIVE values, not the ones the caller typed. Unset w and h
+	// are derived from k (ext/krepp/src/index.cpp:236-237), so what has to agree
+	// is what krepp will actually use - the partial on disk may have been built
+	// with an explicit h that a later job leaves unset. Gating these on
+	// has_value() let exactly that through: same k, one partial at h := 10 and
+	// the next with h unset (k - 16), accepted here and then rejected by krepp
+	// at query time, long after the build. w is worse - LSHF::check_compatible
+	// (ext/krepp/src/lshf.cpp:161) compares m, h, k and the positions but never
+	// w, so a w mismatch is caught nowhere downstream and just leaves one index
+	// holding two different sets of minimizers.
+	//
+	// The positions themselves are drawn from `gen`, which BuildKreppIndex
+	// reseeds to a fixed state before every build - that is what makes two
+	// separately built partials share a hash function at all.
+	int32_t their_k = 0, their_w = 0, their_h = 0;
+	ReadIndexMetadata(data.output_path + "/metadata" + existing.begin()->first + ".txt", their_k, their_w, their_h);
+	// Narrowing to uint8_t before widening mirrors krepp: its k, w and h are all
+	// uint8_t (ext/krepp/src/index.hpp:107-109), so a k below 16 wraps there too
+	// and the prediction has to wrap with it.
+	const auto our_w = static_cast<int32_t>(data.options.w.value_or(static_cast<uint8_t>(data.options.k + 6)));
+	const auto our_h = static_cast<int32_t>(data.options.h.value_or(static_cast<uint8_t>(data.options.k - 16)));
+	const char *which = nullptr;
+	int32_t theirs = 0, mine = 0;
+	if (their_k != static_cast<int32_t>(data.options.k)) {
+		which = "k";
+		theirs = their_k;
+		mine = static_cast<int32_t>(data.options.k);
+	} else if (their_w != our_w) {
+		which = "w";
+		theirs = their_w;
+		mine = our_w;
+	} else if (their_h != our_h) {
+		which = "h";
+		theirs = their_h;
+		mine = our_h;
+	}
+	if (which != nullptr) {
+		throw IOException("%s: output_path '%s' holds partials built with %s := %d, but this build uses %s := %d. "
+		                  "Every partial of one index must agree on k, w, h, m and frac, and differ only in r",
+		                  kCallerName, data.output_path, which, theirs, which, mine);
+	}
+}
+
 unique_ptr<GlobalTableFunctionState> KreppIndexCreateTableFunction::InitGlobal(ClientContext &context,
                                                                                TableFunctionInitInput &input) {
 	auto &data = input.bind_data->Cast<Data>();
 	auto gstate = make_uniq<GlobalState>();
 
-	// krepp creates its output directory and writes files whose names encode
-	// the resolved config; it never clears what is already there. Building into
-	// a directory that already holds an index leaves both sets of partials
-	// behind, and DiscoverPartials would then load both - a mixed index that
-	// reads as valid. Refuse rather than delete anything.
-	std::error_code ec;
-	if (std::filesystem::exists(data.output_path, ec) &&
-	    !std::filesystem::is_empty(std::filesystem::path(data.output_path), ec)) {
-		throw IOException("%s: output_path '%s' already exists and is not empty; krepp writes alongside what is "
-		                  "already there, which would leave two indexes in one directory. If a previous build "
-		                  "failed partway, that directory holds its debris - remove it or choose another path",
-		                  kCallerName, data.output_path);
-	}
+	// krepp creates its output directory and writes files whose names encode the
+	// resolved config; it never clears what is already there. That is a problem
+	// for a SECOND INDEX in the same directory - krepp would load both as one -
+	// but it is exactly how a large index is meant to be built: one residue per
+	// job, every job pointed at the same directory, `-r` varying and everything
+	// else fixed. Refusing every non-empty directory blocked the second case to
+	// prevent the first. So check which one it is, and never delete anything.
+	CheckOutputPathAcceptsPartial(data);
 
 	TempWorkDir work(MakeTempWorkDir());
 
@@ -623,7 +700,11 @@ unique_ptr<GlobalTableFunctionState> KreppIndexCreateTableFunction::InitGlobal(C
 		throw IOException("%s: krepp reported success but '%s' does not hold a complete index: %s", kCallerName,
 		                  data.output_path, std::string(e.what()));
 	}
-	ReadIndexMetadata(data.output_path + "/metadata" + partials.begin()->first + ".txt", gstate->k, gstate->w,
+	// The partial THIS build wrote, not partials.begin() - that is the
+	// lexicographically first suffix in the directory, which in a multi-partial
+	// build is some earlier residue. Reporting its k/w/h beside status='ok'
+	// would describe an index this call did not write.
+	ReadIndexMetadata(data.output_path + "/metadata" + PartialSuffixFor(options) + ".txt", gstate->k, gstate->w,
 	                  gstate->h);
 	gstate->num_references = num_references;
 

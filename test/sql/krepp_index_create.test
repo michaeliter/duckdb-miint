@@ -191,15 +191,24 @@ FROM krepp_index_create('refs_seq2_null', '__TEST_DIR__/idx_seq2_null',
 2	ok
 
 # krepp creates its output directory and writes files whose names encode the
-# resolved config; it never clears what is already there. Building into a
-# directory that already holds an index leaves both sets of partials behind,
-# and place_krepp's DiscoverPartials would then find two complete suffix groups
-# and load both. Refusing is the only option that deletes nothing.
+# resolved config; it never clears what is already there. A directory holding
+# unrelated files is not somewhere to build: krepp would write alongside them,
+# and nothing here deletes. (A directory holding partials of the SAME index is
+# a different case and is allowed - see krepp_index_create_partials.test.)
 
+# PARTITION_BY is used only because it is the one COPY form that creates its
+# own directory; a plain COPY to a path under a missing directory fails.
+statement ok
+COPY (SELECT 1 AS part, 2 AS payload) TO '__TEST_DIR__/debris' (FORMAT CSV, PARTITION_BY (part));
+
+# This pointed at the repository's own test/sql until a reviewer weakened the
+# guard and krepp wrote 16 MB of index files into the source tree, leaving the
+# file permanently unrunnable in that checkout. The assertion needs a directory
+# that holds unrelated files - it does not need that directory to be tracked.
 statement error
-SELECT * FROM krepp_index_create('refs', 'test/sql', tree_table := 'backbone', k := 27, h := 11);
+SELECT * FROM krepp_index_create('refs', '__TEST_DIR__/debris', tree_table := 'backbone', k := 27, h := 11);
 ----
-already exists and is not empty
+does not hold one complete krepp index
 
 # The sequence relation has the same contract as the aligners: read_id plus
 # sequence1.

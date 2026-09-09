@@ -164,6 +164,33 @@ void ValidateNewickLexically(const std::string &newick_text, const std::string &
 // Throws std::runtime_error naming `index_dir`.
 std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::string &index_dir);
 
+// The part of a partial's filename suffix that must AGREE across the partials of
+// one index, with the part that is expected to differ removed.
+//
+// krepp builds the suffix as "-m<M>r<R>" + ("-frac"|"-no_frac")
+// (ext/krepp/src/index.cpp:249-251). Only the hash function and the frac flag
+// have to match: Index::load_partial_index reads k, w, h, m, r and frac out of
+// each partial's metadata but compares just LSHF(m, ppos, npos)
+// (ext/krepp/src/index.cpp:73-86) - `r` is read and never compared, because it
+// is the residue that says WHICH partial this is. Splitting several residues of
+// one index across jobs and pointing krepp at the collected directory is the
+// supported way to build a large index, so treating a differing r as a
+// different index refuses layouts that work.
+//
+// Returns the suffix unchanged if it does not have that shape, so an
+// unrecognised name groups only with itself rather than being merged.
+std::string PartialHashConfig(const std::string &suffix);
+
+// Reads k, w and h out of a krepp `metadata<suffix>.txt` sidecar.
+//
+// Returns false when the file is not there. krepp treats the sidecar as
+// optional - load_partial_index synthesises its contents from the binary
+// `metadata<suffix>` when it is absent (ext/krepp/src/index.cpp:122-135) - so a
+// partial without one is not a broken index and must not be rejected as if it
+// were. Throws std::runtime_error when the file exists but a field cannot be
+// read, which means krepp changed a format it wrote itself.
+bool ReadPartialKWH(const std::string &path, int32_t &k, int32_t &w, int32_t &h);
+
 } // namespace krepp_detail
 
 } // namespace miint

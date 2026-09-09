@@ -119,6 +119,15 @@ void WriteIndexFiles(const std::filesystem::path &dir, const std::string &suffix
 	}
 }
 
+// The "key: value" sidecar krepp writes beside the binary pieces. Only the three
+// fields ValidateIndexLayout reads are written; krepp's real file carries more.
+void WriteMetadataTxt(const std::filesystem::path &dir, const std::string &suffix, int k, int w, int h) {
+	std::ofstream out(dir / ("metadata" + suffix + ".txt"));
+	out << "k: " << k << "\n"
+	    << "w: " << w << "\n"
+	    << "h: " << h << "\n";
+}
+
 // A directory nothing else in this file shares, cleared on the way in so a
 // previous run cannot leak into this one.
 std::filesystem::path FreshDir(const std::string &name) {
@@ -147,16 +156,86 @@ TEST_CASE("ValidateIndexLayout rejects two hash configurations in one directory"
 TEST_CASE("ValidateIndexLayout accepts several partials of one index", "[krepp]") {
 	// The counterpart, and the reason the check keys on the hash configuration
 	// rather than the whole suffix: multiple partials are the normal layout for
-	// a large index, and they differ precisely in the part after it. Keying on
-	// the whole suffix would reject this, which is a worse failure than the one
+	// a large index, and they differ precisely in the residue. Keying on the
+	// whole suffix would reject this, which is a worse failure than the one
 	// being prevented - it would refuse indexes that work.
+	//
+	// These are the real shapes. krepp builds the suffix as "-m<M>r<R>" plus
+	// "-frac" or "-no_frac" (ext/krepp/src/index.cpp:249-251), and one residue
+	// per job into a shared directory is how a large index is meant to be
+	// built. An earlier version of this test used "-m4r1-frac" against
+	// "-m4r1-frac2" - a shape krepp never emits - and so passed while the code
+	// rejected every genuine multi-partial index.
 	const std::filesystem::path dir = FreshDir("onecfg");
 	WriteIndexFiles(dir, "-m4r1-frac");
-	WriteIndexFiles(dir, "-m4r1-frac2");
+	WriteIndexFiles(dir, "-m4r2-frac");
+	WriteIndexFiles(dir, "-m4r3-frac");
+
+	REQUIRE_NOTHROW(ValidateIndexLayout(dir.string()));
+	REQUIRE(ValidateIndexLayout(dir.string()).size() == 3);
+	std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("ValidateIndexLayout rejects partials that disagree on k, w or h", "[krepp]") {
+	// None of the three is in a filename, so two builds that differ in them are
+	// indistinguishable to the suffix check above. krepp catches k and h itself
+	// inside LSHF::check_compatible, but only once the files are open - and it
+	// never compares w at all (ext/krepp/src/lshf.cpp:159-163), reading it into
+	// a local it discards (index.cpp:59-63). A differing w is therefore caught
+	// nowhere downstream and just leaves one index holding two different sets of
+	// minimizers.
+	const std::filesystem::path dir = FreshDir("mixedkwh");
+	WriteIndexFiles(dir, "-m4r1-no_frac");
+	WriteIndexFiles(dir, "-m4r2-no_frac");
+	WriteMetadataTxt(dir, "-m4r1-no_frac", 25, 31, 10);
+	WriteMetadataTxt(dir, "-m4r2-no_frac", 25, 31, 9);
+
+	REQUIRE_THROWS_WITH(ValidateIndexLayout(dir.string()), Catch::Matchers::ContainsSubstring("disagree on k, w or h"));
+	std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("ValidateIndexLayout accepts a partial with no metadata sidecar", "[krepp]") {
+	// krepp treats metadata<suffix>.txt as optional: load_partial_index
+	// synthesises its contents from the binary metadata when it is absent
+	// (ext/krepp/src/index.cpp:122-135). A partial without one is a partial
+	// krepp loads, so requiring it here would reject working indexes - which is
+	// the same mistake, in the other direction, as folding r into the identity.
+	const std::filesystem::path dir = FreshDir("nosidecar");
+	WriteIndexFiles(dir, "-m4r1-no_frac");
+	WriteIndexFiles(dir, "-m4r2-no_frac");
+	WriteMetadataTxt(dir, "-m4r1-no_frac", 25, 31, 9);
 
 	REQUIRE_NOTHROW(ValidateIndexLayout(dir.string()));
 	REQUIRE(ValidateIndexLayout(dir.string()).size() == 2);
 	std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("PartialHashConfig keeps m and frac and drops the residue", "[krepp]") {
+	// What must agree across partials, and what may differ. krepp compares only
+	// LSHF(m, ppos, npos) when loading a partial and reads r without comparing
+	// it (ext/krepp/src/index.cpp:73-86).
+	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") == miint::krepp_detail::PartialHashConfig("-m4r2-frac"));
+	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") ==
+	      miint::krepp_detail::PartialHashConfig("-m4r16-frac"));
+	// m, and the frac flag, are part of the identity.
+	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") != miint::krepp_detail::PartialHashConfig("-m8r1-frac"));
+	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") !=
+	      miint::krepp_detail::PartialHashConfig("-m4r1-no_frac"));
+	// Multi-digit m must not be confused with the residue.
+	CHECK(miint::krepp_detail::PartialHashConfig("-m64r1-frac") !=
+	      miint::krepp_detail::PartialHashConfig("-m6r1-frac"));
+	// ...and must still group with its OWN residues. The line above only rules
+	// out a false merge; without this one a false split goes unnoticed. Parsing
+	// a single digit of m instead of the whole run passes every other assertion
+	// in this file and in the SQL tests - all of which use a one-digit m - and
+	// then rejects a real two-residue m := 64 build as two different indexes.
+	CHECK(miint::krepp_detail::PartialHashConfig("-m64r1-frac") ==
+	      miint::krepp_detail::PartialHashConfig("-m64r2-frac"));
+	// Anything that is not that shape groups only with itself, rather than
+	// being merged with a partial it has nothing to do with.
+	CHECK(miint::krepp_detail::PartialHashConfig("-nonsense") == "-nonsense");
+	CHECK(miint::krepp_detail::PartialHashConfig("-mr1-frac") == "-mr1-frac");
+	CHECK(miint::krepp_detail::PartialHashConfig("-m4r-frac") == "-m4r-frac");
 }
 
 TEST_CASE("ValidateIndexLayout rejects an incomplete index", "[krepp]") {
