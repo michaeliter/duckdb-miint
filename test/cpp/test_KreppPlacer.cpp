@@ -1,10 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "KreppPlacer.hpp"
 
@@ -112,20 +114,30 @@ namespace {
 // The five extensionless files that make up one complete krepp index with a
 // backbone tree. `suffix` is krepp's own: "-m<M>r<R>" (the hash configuration,
 // which every partial of one index shares) followed by a partial id.
-void WriteIndexFiles(const std::filesystem::path &dir, const std::string &suffix) {
+// Writes one complete partial. `metadata<suffix>` is a REAL binary header in
+// krepp's own layout (ext/krepp/src/index.cpp:57-69, written by
+// save_configuration at :410-413), not a stub: ValidateIndexLayout reads k, w
+// and h back out of that file exactly the way krepp does, so a placeholder
+// would fail for the wrong reason.
+void WriteIndexFiles(const std::filesystem::path &dir, uint32_t m, uint32_t r, bool frac, uint8_t k = 25,
+                     uint8_t w = 31, uint8_t h = 9) {
 	std::filesystem::create_directories(dir);
-	for (const char *type : {"cmer", "crecord", "inc", "metadata", "tree"}) {
+	const std::string suffix = miint::krepp_detail::PartialSuffix(m, r, frac);
+	for (const char *type : {"cmer", "crecord", "inc", "tree"}) {
 		std::ofstream(dir / (std::string(type) + suffix)).put('\0');
 	}
-}
-
-// The "key: value" sidecar krepp writes beside the binary pieces. Only the three
-// fields ValidateIndexLayout reads are written; krepp's real file carries more.
-void WriteMetadataTxt(const std::filesystem::path &dir, const std::string &suffix, int k, int w, int h) {
-	std::ofstream out(dir / ("metadata" + suffix + ".txt"));
-	out << "k: " << k << "\n"
-	    << "w: " << w << "\n"
-	    << "h: " << h << "\n";
+	std::ofstream meta(dir / ("metadata" + suffix), std::ofstream::binary);
+	const uint32_t nrows = 1;
+	meta.write(reinterpret_cast<const char *>(&k), sizeof(uint8_t));
+	meta.write(reinterpret_cast<const char *>(&w), sizeof(uint8_t));
+	meta.write(reinterpret_cast<const char *>(&h), sizeof(uint8_t));
+	meta.write(reinterpret_cast<const char *>(&m), sizeof(uint32_t));
+	meta.write(reinterpret_cast<const char *>(&r), sizeof(uint32_t));
+	meta.write(reinterpret_cast<const char *>(&frac), sizeof(bool));
+	meta.write(reinterpret_cast<const char *>(&nrows), sizeof(uint32_t));
+	const std::vector<uint8_t> ppos(h, 0), npos(static_cast<size_t>(k - h), 0);
+	meta.write(reinterpret_cast<const char *>(ppos.data()), static_cast<std::streamsize>(ppos.size()));
+	meta.write(reinterpret_cast<const char *>(npos.data()), static_cast<std::streamsize>(npos.size()));
 }
 
 // A directory nothing else in this file shares, cleared on the way in so a
@@ -145,8 +157,8 @@ TEST_CASE("ValidateIndexLayout rejects two hash configurations in one directory"
 	// Index::check_compatible, which reports it with error_exit. The suffix says
 	// it first.
 	const std::filesystem::path dir = FreshDir("twocfg");
-	WriteIndexFiles(dir, "-m4r1-frac");
-	WriteIndexFiles(dir, "-m8r2-frac");
+	WriteIndexFiles(dir, 4, 1, true);
+	WriteIndexFiles(dir, 8, 2, true);
 
 	REQUIRE_THROWS_WITH(ValidateIndexLayout(dir.string()),
 	                    Catch::Matchers::ContainsSubstring("different hash configurations"));
@@ -167,47 +179,74 @@ TEST_CASE("ValidateIndexLayout accepts several partials of one index", "[krepp]"
 	// "-m4r1-frac2" - a shape krepp never emits - and so passed while the code
 	// rejected every genuine multi-partial index.
 	const std::filesystem::path dir = FreshDir("onecfg");
-	WriteIndexFiles(dir, "-m4r1-frac");
-	WriteIndexFiles(dir, "-m4r2-frac");
-	WriteIndexFiles(dir, "-m4r3-frac");
+	WriteIndexFiles(dir, 4, 1, true);
+	WriteIndexFiles(dir, 4, 2, true);
+	WriteIndexFiles(dir, 4, 3, true);
 
 	REQUIRE_NOTHROW(ValidateIndexLayout(dir.string()));
 	REQUIRE(ValidateIndexLayout(dir.string()).size() == 3);
 	std::filesystem::remove_all(dir);
 }
 
-TEST_CASE("ValidateIndexLayout rejects partials that disagree on k, w or h", "[krepp]") {
-	// None of the three is in a filename, so two builds that differ in them are
-	// indistinguishable to the suffix check above. krepp catches k and h itself
-	// inside LSHF::check_compatible, but only once the files are open - and it
-	// never compares w at all (ext/krepp/src/lshf.cpp:159-163), reading it into
-	// a local it discards (index.cpp:59-63). A differing w is therefore caught
-	// nowhere downstream and just leaves one index holding two different sets of
-	// minimizers.
-	const std::filesystem::path dir = FreshDir("mixedkwh");
-	WriteIndexFiles(dir, "-m4r1-no_frac");
-	WriteIndexFiles(dir, "-m4r2-no_frac");
-	WriteMetadataTxt(dir, "-m4r1-no_frac", 25, 31, 10);
-	WriteMetadataTxt(dir, "-m4r2-no_frac", 25, 31, 9);
+TEST_CASE("ValidateIndexLayout rejects partials that disagree on w", "[krepp]") {
+	// w gets its own case because this check is the ONLY one anywhere. krepp
+	// compares m, h, k and the two position vectors and never w
+	// (ext/krepp/src/lshf.cpp:159-163), and load_partial_index reads w into a
+	// local it discards (index.cpp:57-61). So unlike k and h, a differing w
+	// produces no error at any later point - just one index quietly holding two
+	// different sets of minimizers, and a placement result that is wrong rather
+	// than absent. Measured on a real pair: 148 rows against 140, with 13
+	// placements present in the consistent index and missing from the mixed one.
+	const std::filesystem::path dir = FreshDir("mixedw");
+	WriteIndexFiles(dir, 4, 1, false, 25, 40, 9);
+	WriteIndexFiles(dir, 4, 2, false, 25, 31, 9);
 
 	REQUIRE_THROWS_WITH(ValidateIndexLayout(dir.string()), Catch::Matchers::ContainsSubstring("disagree on k, w or h"));
 	std::filesystem::remove_all(dir);
 }
 
-TEST_CASE("ValidateIndexLayout accepts a partial with no metadata sidecar", "[krepp]") {
-	// krepp treats metadata<suffix>.txt as optional: load_partial_index
-	// synthesises its contents from the binary metadata when it is absent
-	// (ext/krepp/src/index.cpp:122-135). A partial without one is a partial
-	// krepp loads, so requiring it here would reject working indexes - which is
-	// the same mistake, in the other direction, as folding r into the identity.
-	const std::filesystem::path dir = FreshDir("nosidecar");
-	WriteIndexFiles(dir, "-m4r1-no_frac");
-	WriteIndexFiles(dir, "-m4r2-no_frac");
-	WriteMetadataTxt(dir, "-m4r1-no_frac", 25, 31, 9);
+TEST_CASE("ValidateIndexLayout rejects partials that disagree on k or h", "[krepp]") {
+	// The loud half of the same defect. krepp does catch these, from inside
+	// LSHF::check_compatible - but only once the files are open, which for a
+	// real index means after the build that produced them. Deciding it here
+	// keeps the failure at the point where the mistake is still fixable.
+	const std::filesystem::path dir = FreshDir("mixedh");
+	WriteIndexFiles(dir, 4, 1, false, 25, 31, 10);
+	WriteIndexFiles(dir, 4, 2, false, 25, 31, 9);
 
-	REQUIRE_NOTHROW(ValidateIndexLayout(dir.string()));
-	REQUIRE(ValidateIndexLayout(dir.string()).size() == 2);
+	REQUIRE_THROWS_WITH(ValidateIndexLayout(dir.string()), Catch::Matchers::ContainsSubstring("disagree on k, w or h"));
 	std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("ValidateIndexLayout rejects metadata that contradicts its own filename", "[krepp]") {
+	// The binary header has no version marker, so reading k, w and h from fixed
+	// offsets is only safe while the layout holds. m, r and frac are the three
+	// fields whose values the filename already states, which makes them the
+	// format's own witness: writing a header that says m=8 into a file named
+	// -m4r1-no_frac is indistinguishable from krepp having moved the fields,
+	// and either way k/w/h would be read from the wrong place.
+	const std::filesystem::path dir = FreshDir("badwitness");
+	WriteIndexFiles(dir, 4, 1, false);
+	// Same file set, but the header inside describes a different partial.
+	std::filesystem::remove(dir / "metadata-m4r1-no_frac");
+	const std::filesystem::path other = FreshDir("badwitness_src");
+	WriteIndexFiles(other, 8, 1, false);
+	std::filesystem::copy_file(other / "metadata-m8r1-no_frac", dir / "metadata-m4r1-no_frac");
+
+	REQUIRE_THROWS_WITH(ValidateIndexLayout(dir.string()),
+	                    Catch::Matchers::ContainsSubstring("metadata layout has changed"));
+	std::filesystem::remove_all(dir);
+	std::filesystem::remove_all(other);
+}
+
+TEST_CASE("PartialSuffix builds the shape krepp writes", "[krepp]") {
+	// The one place the suffix is constructed, mirroring
+	// ext/krepp/src/index.cpp:249-251. PartialHashConfig parses what this emits
+	// and ReadPartialConfig checks a header against it, so all three move
+	// together or none of them do.
+	CHECK(miint::krepp_detail::PartialSuffix(4, 1, true) == "-m4r1-frac");
+	CHECK(miint::krepp_detail::PartialSuffix(4, 1, false) == "-m4r1-no_frac");
+	CHECK(miint::krepp_detail::PartialSuffix(64, 10, true) == "-m64r10-frac");
 }
 
 TEST_CASE("PartialHashConfig keeps m and frac and drops the residue", "[krepp]") {

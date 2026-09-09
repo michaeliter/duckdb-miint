@@ -246,27 +246,23 @@ uint32_t ReadUIntParam(const named_parameter_map_t &params, const char *key, uin
 	return static_cast<uint32_t>(value);
 }
 
-// krepp writes `metadata<suffix>.txt` as "key: value" lines beside the binary
-// pieces. Read back rather than recomputed so the row reports the index that
-// exists on disk, including the w and h krepp derived from k when they were
-// not given.
+// k, w and h of one partial, read back from disk rather than recomputed so the
+// row reports the index that exists, including the w and h krepp derived from k
+// when they were not given.
 //
-// The parse itself lives in krepp_detail because ValidateIndexLayout needs the
-// same three fields to check that partials agree. The contracts differ only in
-// what a missing file means: there it is legal (krepp synthesises the sidecar),
-// here krepp has just written the index so its absence is a real failure.
-void ReadIndexMetadata(const std::string &path, int32_t &k, int32_t &w, int32_t &h) {
-	bool present = false;
+// Reads the BINARY `metadata<suffix>`, not the `.txt` sidecar beside it. The
+// sidecar is advisory - krepp writes it second, synthesises it when absent, and
+// never compares it - so parsing it here meant reporting values krepp might not
+// be using. ValidateIndexLayout needs the same three fields, so the read lives
+// in krepp_detail and both callers get the same answer.
+void ReadIndexMetadata(const std::string &index_dir, const std::string &suffix, int32_t &k, int32_t &w, int32_t &h) {
 	try {
-		present = miint::krepp_detail::ReadPartialKWH(path, k, w, h);
+		miint::krepp_detail::ReadPartialConfig(index_dir + "/metadata" + suffix, suffix, k, w, h);
 	} catch (const std::exception &e) {
 		// Fail rather than report zeros next to status='ok'. These three columns
 		// are the only way a caller learns what w and h krepp derived, so a
 		// silent 0 would be a wrong answer wearing a success badge.
-		throw IOException("%s: index built, but %s", kCallerName, std::string(e.what()));
-	}
-	if (!present) {
-		throw IOException("%s: index built but its metadata '%s' could not be read", kCallerName, path);
+		throw IOException("%s: %s", kCallerName, std::string(e.what()));
 	}
 }
 
@@ -373,11 +369,11 @@ unique_ptr<FunctionData> KreppIndexCreateTableFunction::Bind(ClientContext &cont
 	return std::move(data);
 }
 
-// The filename suffix krepp will give every file this build writes. Mirrors
-// the IndexMultiple constructor (ext/krepp/src/index.cpp:249-251) exactly; if that
-// ever changes, PartialHashConfig's parse and this have to move together.
+// The filename suffix krepp will give every file this build writes. The shape
+// itself lives in krepp_detail::PartialSuffix, which mirrors the IndexMultiple
+// constructor (ext/krepp/src/index.cpp:249-251); this only supplies the options.
 std::string PartialSuffixFor(const miint::KreppIndexOptions &options) {
-	return "-m" + std::to_string(options.m) + "r" + std::to_string(options.r) + (options.frac ? "-frac" : "-no_frac");
+	return miint::krepp_detail::PartialSuffix(options.m, options.r, options.frac);
 }
 
 // Decide whether `output_path` is somewhere this build may write.
@@ -449,7 +445,7 @@ void CheckOutputPathAcceptsPartial(const KreppIndexCreateTableFunction::Data &da
 	// reseeds to a fixed state before every build - that is what makes two
 	// separately built partials share a hash function at all.
 	int32_t their_k = 0, their_w = 0, their_h = 0;
-	ReadIndexMetadata(data.output_path + "/metadata" + existing.begin()->first + ".txt", their_k, their_w, their_h);
+	ReadIndexMetadata(data.output_path, existing.begin()->first, their_k, their_w, their_h);
 	// Narrowing to uint8_t before widening mirrors krepp: its k, w and h are all
 	// uint8_t (ext/krepp/src/index.hpp:107-109), so a k below 16 wraps there too
 	// and the prediction has to wrap with it.
@@ -704,8 +700,7 @@ unique_ptr<GlobalTableFunctionState> KreppIndexCreateTableFunction::InitGlobal(C
 	// lexicographically first suffix in the directory, which in a multi-partial
 	// build is some earlier residue. Reporting its k/w/h beside status='ok'
 	// would describe an index this call did not write.
-	ReadIndexMetadata(data.output_path + "/metadata" + PartialSuffixFor(options) + ".txt", gstate->k, gstate->w,
-	                  gstate->h);
+	ReadIndexMetadata(data.output_path, PartialSuffixFor(options), gstate->k, gstate->w, gstate->h);
 	gstate->num_references = num_references;
 
 	return std::move(gstate);

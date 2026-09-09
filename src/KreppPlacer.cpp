@@ -165,44 +165,44 @@ void ValidateNewickLexically(const std::string &newick_text, const std::string &
 	}
 }
 
-bool ReadPartialKWH(const std::string &path, int32_t &k, int32_t &w, int32_t &h) {
-	std::ifstream in(path);
+std::string PartialSuffix(uint32_t m, uint32_t r, bool frac) {
+	return "-m" + std::to_string(m) + "r" + std::to_string(r) + (frac ? "-frac" : "-no_frac");
+}
+
+void ReadPartialConfig(const std::string &path, const std::string &expect_suffix, int32_t &k, int32_t &w, int32_t &h) {
+	std::ifstream in(path, std::ifstream::binary);
 	if (!in) {
-		return false;
+		throw std::runtime_error("krepp metadata " + path + " could not be opened");
 	}
-	int32_t *const targets[3] = {&k, &w, &h};
-	const char *const keys[3] = {"k", "w", "h"};
-	bool found[3] = {false, false, false};
-	std::string line;
-	while (std::getline(in, line)) {
-		const size_t colon = line.find(':');
-		if (colon == std::string::npos) {
-			continue;
-		}
-		const std::string key = line.substr(0, colon);
-		std::string value = line.substr(colon + 1);
-		while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
-			value.erase(value.begin());
-		}
-		for (size_t i = 0; i < 3; i++) {
-			if (key != keys[i]) {
-				continue;
-			}
-			try {
-				*targets[i] = std::stoi(value);
-				found[i] = true;
-			} catch (const std::exception &) {
-				// Left false; the loop below turns it into an error.
-			}
-		}
+	// Field order and widths are krepp's, read the same way it reads them
+	// (ext/krepp/src/index.cpp:57-63). Only the first six are needed; nrows and
+	// the position vectors follow and are left alone.
+	uint8_t k_raw = 0, w_raw = 0, h_raw = 0;
+	uint32_t m_raw = 0, r_raw = 0;
+	bool frac_raw = false;
+	in.read(reinterpret_cast<char *>(&k_raw), sizeof(uint8_t));
+	in.read(reinterpret_cast<char *>(&w_raw), sizeof(uint8_t));
+	in.read(reinterpret_cast<char *>(&h_raw), sizeof(uint8_t));
+	in.read(reinterpret_cast<char *>(&m_raw), sizeof(uint32_t));
+	in.read(reinterpret_cast<char *>(&r_raw), sizeof(uint32_t));
+	in.read(reinterpret_cast<char *>(&frac_raw), sizeof(bool));
+	if (!in) {
+		throw std::runtime_error("krepp metadata " + path +
+		                         " is shorter than krepp's own header; the file is "
+		                         "truncated or was not written by krepp");
 	}
-	for (size_t i = 0; i < 3; i++) {
-		if (!found[i]) {
-			throw std::runtime_error("krepp metadata " + path + " has no readable '" + std::string(keys[i]) +
-			                         "' field; krepp's metadata format has changed");
-		}
+	// The format's own witness. m, r and frac are the three fields whose value
+	// is already known from the filename, so a disagreement means the layout has
+	// moved underneath us and k, w and h are being read from the wrong offsets.
+	const std::string found_suffix = PartialSuffix(m_raw, r_raw, frac_raw);
+	if (found_suffix != expect_suffix) {
+		throw std::runtime_error("krepp metadata " + path + " describes '" + found_suffix +
+		                         "' but its filename says '" + expect_suffix +
+		                         "'; krepp's metadata layout has changed");
 	}
-	return true;
+	k = static_cast<int32_t>(k_raw);
+	w = static_cast<int32_t>(w_raw);
+	h = static_cast<int32_t>(h_raw);
 }
 
 std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::string &index_dir) {
@@ -275,17 +275,17 @@ std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::stri
 	// open - and it never compares w at all (ext/krepp/src/lshf.cpp:159-163),
 	// reading it into a local it discards (index.cpp:59-63), so a differing w is
 	// caught nowhere and simply leaves one index holding two different sets of
-	// minimizers. Compare all three here, from the sidecar metadata, before
-	// anything is loaded.
+	// minimizers. Compare all three here, from the binary metadata krepp itself
+	// reads, before anything is loaded.
 	const std::string *named = nullptr;
 	int32_t first_k = 0, first_w = 0, first_h = 0;
 	for (const auto &entry : partials) {
 		int32_t k = 0, w = 0, h = 0;
-		// Absent sidecar: skipped, not rejected - krepp synthesises it when it
-		// is missing, so a partial without one is still a valid partial.
-		if (!ReadPartialKWH(index_dir + "/metadata" + entry.first + ".txt", k, w, h)) {
-			continue;
-		}
+		// Every partial, unconditionally. The binary metadata is mandatory and
+		// the completeness check above already required it, so there is no
+		// absent case to tolerate - and tolerating one would delete the only
+		// check on w that exists anywhere.
+		ReadPartialConfig(index_dir + "/metadata" + entry.first, entry.first, k, w, h);
 		if (named == nullptr) {
 			named = &entry.first;
 			first_k = k;

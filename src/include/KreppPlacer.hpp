@@ -181,15 +181,30 @@ std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::stri
 // unrecognised name groups only with itself rather than being merged.
 std::string PartialHashConfig(const std::string &suffix);
 
-// Reads k, w and h out of a krepp `metadata<suffix>.txt` sidecar.
+// The filename suffix krepp gives every file of one partial. The single place
+// this is built; ext/krepp/src/index.cpp:249-251 is what it mirrors.
+std::string PartialSuffix(uint32_t m, uint32_t r, bool frac);
+
+// Reads k, w and h out of a partial's BINARY `metadata<suffix>`.
 //
-// Returns false when the file is not there. krepp treats the sidecar as
-// optional - load_partial_index synthesises its contents from the binary
-// `metadata<suffix>` when it is absent (ext/krepp/src/index.cpp:122-135) - so a
-// partial without one is not a broken index and must not be rejected as if it
-// were. Throws std::runtime_error when the file exists but a field cannot be
-// read, which means krepp changed a format it wrote itself.
-bool ReadPartialKWH(const std::string &path, int32_t &k, int32_t &w, int32_t &h);
+// Not the `metadata<suffix>.txt` sidecar. The sidecar is advisory: krepp writes
+// it after the binary (ext/krepp/src/index.cpp:410-420), synthesises it when it
+// is missing (:122-135), and never consults it for compatibility. The binary is
+// mandatory - load_partial_index error_exits without it (:52-55) - it is what
+// LSHF::check_compatible is fed from (:57-69), and the completeness check above
+// already requires it, so a complete partial always has one. Reading the
+// sidecar instead meant a partial that had lost its .txt was silently skipped,
+// which mattered most for `w`: krepp compares m, h, k and the positions but
+// never w (ext/krepp/src/lshf.cpp:159-163), so this is the only w check there
+// is, and skipping it produced a wrong placement result with no error at all.
+//
+// The layout is fixed and carries no version marker, so m, r and frac are read
+// back too and checked against `expect_suffix`, which the filename already
+// gave us. Those three are the format's own witness: if they disagree, the
+// layout has moved and k/w/h cannot be trusted either.
+//
+// Throws std::runtime_error if the file cannot be read or the witness fails.
+void ReadPartialConfig(const std::string &path, const std::string &expect_suffix, int32_t &k, int32_t &w, int32_t &h);
 
 } // namespace krepp_detail
 
