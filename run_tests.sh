@@ -434,15 +434,15 @@ fi
 # test/sql/place_krepp_toy.test skips; the validation tests in
 # test/sql/place_krepp.test still run.
 #
-# NOTE ON THE BINARY. As of 2026-09-05 bioconda's newest krepp is 0.8.2, on
-# every platform including macOS, while the submodule pins v0.9.1 - so
-# `conda install bioconda::krepp` gives a binary that would write an index the
-# linked library does not read the same way. Build it from source
+# NOTE ON THE BINARY. As of 2026-09-10 bioconda's newest krepp is 0.9.1, while
+# the submodule pins 31205033, which reports v0.10.0 and is not tagged - so
+# `conda install bioconda::krepp` gives a binary older than the linked library.
+# Build it from source at the submodule's commit
 # (`git clone https://github.com/bo1929/krepp && cd krepp &&
-# git submodule update --init --recursive && make`) until upstream publishes
-# 0.9.1. The stamp below records the CLI banner precisely so a mismatch forces
-# a rebuild rather than being silently reused, but nothing compares it against
-# the linked version - see MIINT_KREPP_TOY_INDEX in the docs.
+# git checkout <ext/krepp's commit> && git submodule update --init --recursive
+# && make`). The stamp below records the CLI banner precisely so a mismatch
+# forces a rebuild rather than being silently reused, but nothing compares it
+# against the linked version - see MIINT_KREPP_TOY_INDEX in the docs.
 #
 # The stamp pins three things, so the ~20 s build happens once and repeats only
 # when one of them moves. Everything lands in data/krepp/, which is gitignored.
@@ -569,14 +569,14 @@ if [ -n "$KREPP_TOY_WANT" ]; then
         export MIINT_KREPP_TOY_INDEX="$KREPP_TOY_INDEX"
     fi
 elif [ -n "$KREPP_AVAILABLE" ]; then
-    # Say so. bioconda's newest krepp is 0.8.2 against a v0.9.1 pin, so "CLI not
+    # Say so. bioconda's newest krepp is older than the pinned commit, so "CLI not
     # found" is the expected case rather than the exotic one, and a silent skip
     # here looks identical to a passing end-to-end suite.
     if ! command -v krepp &> /dev/null; then
         echo "Note: krepp CLI not on PATH, so the toy index cannot be built and"
-        echo "      place_krepp end-to-end tests are being skipped. bioconda ships"
-        echo "      0.8.2, which writes an index this build misreads - build v0.9.1"
-        echo "      from source (https://github.com/bo1929/krepp) to run them."
+        echo "      place_krepp end-to-end tests are being skipped. Build krepp from"
+        echo "      source at ext/krepp's commit (https://github.com/bo1929/krepp) to"
+        echo "      run them; bioconda's build is older than the linked library."
     elif ! command -v xz &> /dev/null; then
         echo "Note: xz not on PATH, so krepp's reference tarball cannot be unpacked"
         echo "      and place_krepp end-to-end tests are being skipped."

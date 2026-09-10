@@ -1292,7 +1292,7 @@ if(MIINT_ENABLE_ABPOA)
     endif()
 endif()
 
-# Build krepp phylogenetic placement (v0.9.1).
+# Build krepp phylogenetic placement (v0.10.0, commit 31205033).
 # Header-only dependencies come from vcpkg rather than krepp's own submodules.
 # ext/krepp/src/krepp.cpp is omitted: it holds main() and the CLI11 argument
 # layer. KreppPlacer therefore reimplements krepp's index discovery, which

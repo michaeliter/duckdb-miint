@@ -79,15 +79,16 @@ SELECT count(*) FROM (
 # returns an unsigned se_t, so a negative value cannot reach this column and the
 # clause would only look like it was checking something.
 #
-# pendant_length is deliberately absent: krepp emits negative pendant lengths,
-# which jplace does not allow for a branch length. Measured on this index, 270
-# of 404 rows are negative, down to -0.14971, and krepp's own CLI produces the
-# identical values - so this is krepp's output, not a mapping error here.
-# Anything feeding these into tree_resolve_placement gets a negative branch.
+# pendant_length gets the same floor because tree_resolve_placement inserts it
+# as a branch, and a negative branch cannot be represented there. Before
+# 31205033 krepp computed it as the Jukes-Cantor distance minus half the edge,
+# and on this index 270 of 404 rows came out negative, down to -0.14971. krepp
+# now floors it at 0 in make_placement (ext/krepp/src/query.cpp), so this clause
+# fails against the older krepp.
 query I
 SELECT count(*)
 FROM place_krepp(query_table='toy_reads', index_path='${MIINT_KREPP_TOY_INDEX}')
-WHERE distal_length < 0 OR distance < 0
+WHERE distal_length < 0 OR pendant_length < 0 OR distance < 0
    OR like_weight_ratio < 0 OR like_weight_ratio > 1;
 ----
 0
@@ -545,32 +546,54 @@ true
 # the per-fragment sum above. pendant_length and distal_length are the pair that
 # would swap invisibly — both are small doubles on the same scale.
 #
-# There is an oracle-free property that separates them. krepp attaches at the
-# edge midpoint, so distal_length is get_midpoint_pendant() = blen/2
-# (ext/krepp/src/phytree.hpp:132-138) — a function of the EDGE alone, identical
-# for every read placed there. pendant_length is the Jukes-Cantor distance minus
-# that, so it varies per read. Swap the two and this assertion fails at once.
+# There is an oracle-free property that separates them. distal_length locates
+# the attachment point ON the edge, so it never exceeds the edge's branch length:
+# make_placement clamps it inside the edge, or takes min(t/2, d_c)
+# (ext/krepp/src/query.cpp:218-242). pendant_length is the length of a new branch
+# hanging off that point and has no such bound. Swap the two and the bound check
+# below fails; the query after it shows the swap would have something to trip on.
+#
+# Branch lengths are looked up by edge number, so the backbone goes in through
+# newick_path carrying edge numbers this file chooses (node_index * 10 + 3). The
+# join then does not depend on how krepp numbers an undecorated tree. On this
+# index that backbone yields the same placements and branch lengths as the
+# index's own tree.
+
+statement ok
+CREATE TABLE distal_bound_backbone AS
+SELECT node_index, parent_index, name, branch_length, node_index * 10 + 3 AS edge_id
+FROM read_newick('ext/krepp/test/tree_toy.nwk');
+
+statement ok
+COPY distal_bound_backbone TO '__TEST_DIR__/distal_bound_backbone.nwk' (FORMAT NEWICK, EDGE_IDS true);
+
+statement ok
+CREATE TABLE distal_bound_placements AS
+SELECT * FROM place_krepp(query_table='toy_reads', index_path='${MIINT_KREPP_TOY_INDEX}',
+                          newick_path='__TEST_DIR__/distal_bound_backbone.nwk');
+
+# Every row lands on an edge the backbone names, so the two checks below see
+# every row rather than whatever happened to join.
+query II
+SELECT count(*) > 0, count(*) FILTER (WHERE b.edge_id IS NULL)
+FROM distal_bound_placements p LEFT JOIN distal_bound_backbone b ON b.edge_id = p.edge_num;
+----
+true	0
 
 query I
-SELECT count(*) FROM (
-    SELECT edge_num
-    FROM place_krepp(query_table='toy_reads', index_path='${MIINT_KREPP_TOY_INDEX}')
-    GROUP BY edge_num
-    HAVING count(DISTINCT distal_length) > 1
-);
+SELECT count(*)
+FROM distal_bound_placements p JOIN distal_bound_backbone b ON b.edge_id = p.edge_num
+WHERE p.distal_length > coalesce(b.branch_length, 0.0);
 ----
 0
 
-# Anti-vacuity, and the other half of the discriminator: pendant_length must
-# vary within an edge. Without this the check above would also pass on a result
-# where every edge happened to carry a single row.
+# Anti-vacuity, and the other half of the discriminator: some pendant_length
+# exceeds its edge's branch length (105 of 404 rows, measured on this index), so
+# a swap moves those values into distal_length and the query above fails.
 query I
-SELECT count(*) > 0 FROM (
-    SELECT edge_num
-    FROM place_krepp(query_table='toy_reads', index_path='${MIINT_KREPP_TOY_INDEX}')
-    GROUP BY edge_num
-    HAVING count(DISTINCT pendant_length) > 1
-);
+SELECT count(*) > 0
+FROM distal_bound_placements p JOIN distal_bound_backbone b ON b.edge_id = p.edge_num
+WHERE p.pendant_length > coalesce(b.branch_length, 0.0);
 ----
 true
 

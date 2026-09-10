@@ -10,7 +10,7 @@ require-env MIINT_KREPP_TOY_REFS
 
 # The round trip krepp_index_create exists for: references and a backbone that
 # live as rows go in, an index comes out, and place_krepp reads it. Nothing here
-# needs krepp's CLI - the index is built in-process by the same linked v0.9.1
+# needs krepp's CLI - the index is built in-process by the same linked krepp
 # that reads it, which is the whole point. run_tests.sh only has to unpack the
 # tutorial references.
 #

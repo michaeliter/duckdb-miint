@@ -187,8 +187,8 @@ Requires an index built beforehand, either by [`krepp_index_create`](#build-a-kr
 - `edge_num` (BIGINT): Edge of the backbone tree the placement sits on
 - `likelihood` (DOUBLE): Log likelihood of the placement
 - `like_weight_ratio` (DOUBLE): Likelihood weight ratio. Sums to 1 across one fragment's rows **with `multi` on**; with `multi=false` the single row keeps its share of a total computed over all the candidates that were discarded, so it is below 1 whenever there was more than one. It is a distribution over the candidate edges of one read, so aggregate it per `fragment` (or per `edge_num` across reads) — a bare `sum(like_weight_ratio)` over the whole table is not a meaningful quantity.
-- `distal_length` (DOUBLE): Distance from the distal end of the edge to the placement point. krepp always attaches at the edge **midpoint**, so this is exactly half the edge's branch length (0 for an edge with no length) and carries no per-placement information. Unlike pplacer or EPA-ng, which fit an attachment point, so do not read it as one.
-- `pendant_length` (DOUBLE): Pendant branch length, computed as the Jukes-Cantor distance minus that same half branch length. That subtraction is why krepp emits **negative** values here for a substantial fraction of placements, which jplace does not permit for a branch length; feeding these straight into [`tree_resolve_placement`](#resolve-placements) produces negative branches. Clamp or filter if that matters to you.
+- `distal_length` (DOUBLE): Distance from the distal (child) end of the edge to the attachment point, always within the edge. With `t` the edge's branch length (0 if it has none), `d_c` the read's Jukes-Cantor distance to the edge's child node, and `d_p` its distance to the parent node when the parent is also a candidate: `t·d_c/d_p`, clamped to lie strictly inside the edge, when `d_p` is finite and positive; otherwise `min(t/2, d_c)` (krepp's `make_placement`, `ext/krepp/src/query.cpp`). Reads placed on the same edge therefore get different values.
+- `pendant_length` (DOUBLE): Length of the branch joining the read to the attachment point, never negative: `max(0, min(d_c − distal, d_p − t + distal))` in the first case above, `max(0, d_c − distal)` in the second.
 - `distance` (DOUBLE): krepp's estimated distance to the placement. Not part of jplace; `read_jplace` has no equivalent column.
 
 **Behavior:**
@@ -200,17 +200,17 @@ Requires an index built beforehand, either by [`krepp_index_create`](#build-a-kr
 
 **Reproducibility:** krepp's output is not bit-reproducible, and neither is this function. krepp accumulates and normalizes placements through hash maps keyed by tree-node *pointer*, so iteration order moves with the heap layout. What that costs you, measured on the toy index:
 
-The unit that matters is the **index load**, not the process: each `place_krepp` call loads its own copy in `InitGlobal`, so two calls in one session are already in different regimes. Everything below was re-measured on krepp v0.9.1 against the toy index that `run_tests.sh` builds, and every figure is an observation on that index rather than a bound.
+The unit that matters is the **index load**, not the process: each `place_krepp` call loads its own copy in `InitGlobal`, so two calls in one session are already in different regimes. Everything below was re-measured on krepp v0.10.0 (`31205033`) against the toy index that `run_tests.sh` builds, and every figure is an observation on that index rather than a bound.
 
-krepp v0.9.1 added a de-duplication pass to its k-mer match accumulation, described upstream as a consistent tie break. Measured here, it does not make the output reproducible — the figures below are essentially unchanged from v0.9.0.
+krepp v0.9.1 added a de-duplication pass to its k-mer match accumulation, described upstream as a consistent tie break. Measured on v0.9.1, it did not make the output reproducible; the figures were essentially unchanged from v0.9.0.
 
 | Quantity | Reproducible? |
 |---|---|
 | Which reads place at all (`fragment` set), and the total row count | Stable in every run measured — 5 separate processes, identical (404 rows over 92 fragments) |
-| `likelihood`, `distance`, `distal_length`, `pendant_length` | Bit-identical across repeated calls |
+| `likelihood`, `distance`, `distal_length`, `pendant_length` | Bit-identical across repeated calls, and across 5 separate processes |
 | Which candidate edges appear (the `(fragment, edge_num)` set) | Identical across repeated calls |
-| `like_weight_ratio` | **No.** Three processes were each asked for the same placements twice; the two answers differed in 28, 38 and 102 of 404 rows respectively, by up to 2.5e-4 absolute. Per-fragment sums still come to 1 (measured max deviation 2.2e-16; the test pins 1e-9). |
-| Which candidate edges appear, with `multi` on | Stable across two loads in one process; krepp's own CLI varied across processes |
+| `like_weight_ratio` | **No.** Three processes were each asked for the same placements twice; the two answers differed in 59, 55 and 73 of 404 rows respectively, by up to 2.5e-4 absolute. Per-fragment sums still come to 1 (measured max deviation 2.2e-16; the test pins 1e-9). |
+| Which candidate edges appear, with `multi` on | Identical across two loads in one process, across 5 separate processes, and across 6 runs of krepp's own CLI |
 | Which single edge is chosen, with `multi=false` | **No.** Over 6 runs of `krepp place --no-multi`, 1 of 92 fragments alternated between two edges. |
 
 The `multi=false` case is worth understanding rather than just avoiding: krepp ranks candidates with a non-stable `std::sort` over a vector built by iterating a hash map keyed by tree-node *pointer*, then takes the last element. Equal-ranking candidates therefore land in an order that moves with the heap. The observed rate is low, but which read it hits is not something you can predict or pin.
@@ -239,13 +239,9 @@ SELECT * FROM place_krepp(
 
 -- Feed placements into tree_resolve_placement, which names the same
 -- quantities differently
--- pendant_length is clamped at 0 here on purpose: krepp emits negative values
--- for most placements (see the column description above) and a negative branch
--- length is not something tree_resolve_placement can represent.
 CREATE TABLE placements AS
 SELECT fragment AS fragment_id, edge_num AS edge_id,
-       like_weight_ratio, distal_length,
-       greatest(pendant_length, 0.0) AS pendant_length
+       like_weight_ratio, distal_length, pendant_length
 FROM place_krepp(query_table='reads', index_path='index_toy');
 
 SELECT * FROM tree_resolve_placement('ref_tree', 'placements');
@@ -255,7 +251,7 @@ SELECT * FROM tree_resolve_placement('ref_tree', 'placements');
 
 ### Build a krepp index
 
-Build the index [`place_krepp`](#phylogenetic-placement-krepp) reads, from relations already in the database. The same linked krepp writes it and reads it, so the writer's version and the reader's version cannot drift apart — which matters more here than it sounds: an index written by a different krepp is *misread* rather than rejected (v0.9.0 swapped the recursion branches in `Node::generate_tree`), and as of 2026-09-05 bioconda's newest krepp is 0.8.2 against the v0.9.1+ this links.
+Build the index [`place_krepp`](#phylogenetic-placement-krepp) reads, from relations already in the database. The same linked krepp writes it and reads it, so the writer's version and the reader's version cannot drift apart — which matters more here than it sounds: an index written by a different krepp is *misread* rather than rejected (v0.9.0 swapped the recursion branches in `Node::generate_tree`), and as of 2026-09-10 bioconda's newest krepp is 0.9.1, older than the untagged v0.10.0 (`31205033`) this links.
 
 **Function signature**:
 

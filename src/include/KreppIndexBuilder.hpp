@@ -4,7 +4,7 @@
  * KreppIndexBuilder - C++ wrapper for krepp index construction.
  *
  * The mirror of KreppPlacer: that one loads an index krepp's CLI wrote, this
- * one writes an index KreppPlacer can load, from the same linked v0.9.1. Same
+ * one writes an index KreppPlacer can load, from the same linked krepp. Same
  * PIMPL discipline for the same reason - krepp's headers reach exactly one
  * translation unit, because their klib basenames collide with minimap2's and
  * their seq_nt4_table is a different table of a different length.
