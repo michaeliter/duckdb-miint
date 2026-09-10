@@ -162,6 +162,26 @@ Resolve phylogenetic placements into a reference tree, returning a fully resolve
 - Works with both tables and views for either parameter
 - Schema is UNION ALL-compatible with `read_newick`
 
+**Reproducibility:** The resolved tree is a function of the placement rows, not
+of the order they arrive in or of how they hash. Two things secure that.
+
+The placements table is read in a pinned order (`fragment_id`,
+`like_weight_ratio DESC`, `pendant_length`, `edge_id`), because deduplication
+compares `like_weight_ratio` with a 1e-9 tolerance and "within tolerance" is not
+transitive — `a ~ b` and `b ~ c` do not imply `a ~ c` — so a single greedy pass
+over unordered rows can keep a different survivor each time. Note that this pins
+which row survives without making it the highest `like_weight_ratio`: a chain of
+rows each within tolerance of the next walks the pass down to the lowest
+`pendant_length` in the chain, which may sit outside tolerance of the maximum.
+
+Edge grouping and chain order are then keyed on the data itself — edges in
+`edge_id` order, placements within an edge by `distal_length` then `fragment_id`
+— rather than on `std::unordered_map` iteration, whose order is unspecified and
+varies with insertion order and standard-library implementation. The
+`fragment_id` tiebreak matters because a placer reporting one position per edge
+leaves `distal_length` tied across every fragment sharing that edge; measured on
+`place_krepp` output, 735 of 735 edges had a single distinct `distal_length`.
+
 **Examples:**
 ```sql
 -- Basic workflow: load tree, load placements, resolve
