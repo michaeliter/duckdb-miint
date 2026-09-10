@@ -556,6 +556,22 @@ unique_ptr<GlobalTableFunctionState> KreppIndexCreateTableFunction::InitGlobal(C
 		// the SequenceRecordBatch it accumulates in between. Revisit if a
 		// second caller wants the same per-row rejections.
 		auto conn = MakeReadOnlyHelperConnection(context);
+		// DuckDB pauses the producer of a streaming result once the chunks
+		// buffered for Fetch reach streaming_buffer_size, as counted by
+		// Vector::GetAllocationSize, which is 16 bytes a row for VARCHAR however
+		// long the strings are (duckdb/src/common/types/vector.cpp:895). At the
+		// default 976.5 KiB, peak RSS while the FASTA were written grew with the
+		// sequence bytes: 2.05 GiB for 400 random 4 Mbp genomes, 3.73 GiB for 800
+		// (m := 64, r := 0, frac := false, threads := 8). At 1KB it was 0.79 and
+		// 0.81 GiB, against 0.76 GiB for a plain scan of the same Parquet file;
+		// the index files were byte-identical, and krepp's build started after
+		// 51 s and 101 s instead of 44 s and 89 s. The setting is local to this
+		// connection.
+		auto buffer_setting = conn.Query("SET streaming_buffer_size = '1KB'");
+		if (buffer_setting->HasError()) {
+			throw InternalException("%s: failed to limit the stream buffer: %s", kCallerName,
+			                        buffer_setting->GetError());
+		}
 		// Cast to VARCHAR so a BIGINT read_id and a text one reach krepp the
 		// same way; a reference name is text on both sides of the map.
 		// sequence2 is selected only to refuse it. A krepp reference is one

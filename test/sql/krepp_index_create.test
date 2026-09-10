@@ -190,6 +190,27 @@ FROM krepp_index_create('refs_seq2_null', '__TEST_DIR__/idx_seq2_null',
 ----
 2	ok
 
+# krepp_index_create lowers streaming_buffer_size on the connection it reads
+# sequence_table through (see InitGlobal); the caller's connection keeps its own.
+
+statement ok
+SET streaming_buffer_size = '7MB';
+
+query I
+SELECT status
+FROM krepp_index_create('refs_seq2_null', '__TEST_DIR__/idx_stream_buffer',
+                        tree_table := 'backbone', k := 25, w := 25, h := 9);
+----
+ok
+
+query I
+SELECT current_setting('streaming_buffer_size');
+----
+6.6 MiB
+
+statement ok
+RESET streaming_buffer_size;
+
 # krepp creates its output directory and writes files whose names encode the
 # resolved config; it never clears what is already there. A directory holding
 # unrelated files is not somewhere to build: krepp would write alongside them,
