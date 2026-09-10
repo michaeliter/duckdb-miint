@@ -380,8 +380,9 @@ std::string PartialSuffixFor(const miint::KreppIndexOptions &options) {
 //
 // Absent or empty: yes. Already holding partials of the SAME index at a
 // different residue: yes - that is the multi-partial build, and adding to it is
-// the point. Holding a different index, this exact residue, or debris: no, and
-// we neither delete nor overwrite any of it.
+// the point. It exists only under frac := false (see PartialHashConfig).
+// Holding a different index, this exact residue, a frac := true partial, or
+// debris: no, and we neither delete nor overwrite any of it.
 void CheckOutputPathAcceptsPartial(const KreppIndexCreateTableFunction::Data &data) {
 	std::error_code ec;
 	if (!std::filesystem::exists(data.output_path, ec)) {
@@ -422,7 +423,8 @@ void CheckOutputPathAcceptsPartial(const KreppIndexCreateTableFunction::Data &da
 	if (our_config != their_config) {
 		throw IOException("%s: output_path '%s' holds an index built with a different hash configuration "
 		                  "('%s' vs this build's '%s'); krepp would load them as one index and reject them. "
-		                  "Partials of one index must share m and frac, and differ only in r",
+		                  "Partials of one index must share m and frac, and differ only in r, which frac := true "
+		                  "does not allow: a frac := true index is a single partial",
 		                  kCallerName, data.output_path, their_config.substr(1), our_config.substr(1));
 	}
 
@@ -468,7 +470,8 @@ void CheckOutputPathAcceptsPartial(const KreppIndexCreateTableFunction::Data &da
 	}
 	if (which != nullptr) {
 		throw IOException("%s: output_path '%s' holds partials built with %s := %d, but this build uses %s := %d. "
-		                  "Every partial of one index must agree on k, w, h, m and frac, and differ only in r",
+		                  "Every partial of one index must agree on k, w, h, m and frac, and differ only in r, "
+		                  "which frac := true does not allow",
 		                  kCallerName, data.output_path, which, theirs, which, mine);
 	}
 }

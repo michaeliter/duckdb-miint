@@ -156,9 +156,11 @@ TEST_CASE("ValidateIndexLayout rejects two hash configurations in one directory"
 	// every complete group it finds and only notices the mismatch inside
 	// Index::check_compatible, which reports it with error_exit. The suffix says
 	// it first.
+	// frac := false, so m is the only thing separating the two: under frac := true
+	// their different r would reject them on its own.
 	const std::filesystem::path dir = FreshDir("twocfg");
-	WriteIndexFiles(dir, 4, 1, true);
-	WriteIndexFiles(dir, 8, 2, true);
+	WriteIndexFiles(dir, 4, 1, false);
+	WriteIndexFiles(dir, 8, 2, false);
 
 	REQUIRE_THROWS_WITH(ValidateIndexLayout(dir.string()),
 	                    Catch::Matchers::ContainsSubstring("different hash configurations"));
@@ -175,16 +177,33 @@ TEST_CASE("ValidateIndexLayout accepts several partials of one index", "[krepp]"
 	// These are the real shapes. krepp builds the suffix as "-m<M>r<R>" plus
 	// "-frac" or "-no_frac" (ext/krepp/src/index.cpp:249-251), and one residue
 	// per job into a shared directory is how a large index is meant to be
-	// built. An earlier version of this test used "-m4r1-frac" against
-	// "-m4r1-frac2" - a shape krepp never emits - and so passed while the code
-	// rejected every genuine multi-partial index.
+	// built - with frac := false, the only setting under which krepp loads
+	// several partials together (frac := true is the next test). An earlier
+	// version of this test used "-m4r1-frac" against "-m4r1-frac2" - a shape
+	// krepp never emits - and so passed while the code rejected every genuine
+	// multi-partial index.
 	const std::filesystem::path dir = FreshDir("onecfg");
-	WriteIndexFiles(dir, 4, 1, true);
-	WriteIndexFiles(dir, 4, 2, true);
-	WriteIndexFiles(dir, 4, 3, true);
+	WriteIndexFiles(dir, 4, 1, false);
+	WriteIndexFiles(dir, 4, 2, false);
+	WriteIndexFiles(dir, 4, 3, false);
 
 	REQUIRE_NOTHROW(ValidateIndexLayout(dir.string()));
 	REQUIRE(ValidateIndexLayout(dir.string()).size() == 3);
+	std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("ValidateIndexLayout rejects several frac := true partials", "[krepp]") {
+	// Under frac := true, r is a cumulative threshold rather than a residue
+	// (ext/krepp/src/rqseq.cpp:133), and krepp refuses to load two partials that
+	// differ in it (LSHF::check_compatible, ext/krepp/src/lshf.cpp:163-170), which
+	// it reports only once the files are open. Two frac := true partials of one m
+	// are two indexes, and the layout check says so before anything is opened.
+	const std::filesystem::path dir = FreshDir("twofrac");
+	WriteIndexFiles(dir, 4, 1, true);
+	WriteIndexFiles(dir, 4, 2, true);
+
+	REQUIRE_THROWS_WITH(ValidateIndexLayout(dir.string()),
+	                    Catch::Matchers::ContainsSubstring("different hash configurations (m4r1-frac, m4r2-frac)"));
 	std::filesystem::remove_all(dir);
 }
 
@@ -249,13 +268,14 @@ TEST_CASE("PartialSuffix builds the shape krepp writes", "[krepp]") {
 	CHECK(miint::krepp_detail::PartialSuffix(64, 10, true) == "-m64r10-frac");
 }
 
-TEST_CASE("PartialHashConfig keeps m and frac and drops the residue", "[krepp]") {
-	// What must agree across partials, and what may differ. krepp compares only
-	// LSHF(m, ppos, npos) when loading a partial and reads r without comparing
-	// it (ext/krepp/src/index.cpp:73-86).
-	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") == miint::krepp_detail::PartialHashConfig("-m4r2-frac"));
-	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") ==
-	      miint::krepp_detail::PartialHashConfig("-m4r16-frac"));
+TEST_CASE("PartialHashConfig keeps m and frac and drops a frac := false residue", "[krepp]") {
+	// What must agree across partials, and what may differ. Under frac := false
+	// krepp compares the hash configuration without r (LSHF::check_compatible,
+	// ext/krepp/src/lshf.cpp:163-170); frac := true is the next test.
+	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-no_frac") ==
+	      miint::krepp_detail::PartialHashConfig("-m4r2-no_frac"));
+	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-no_frac") ==
+	      miint::krepp_detail::PartialHashConfig("-m4r16-no_frac"));
 	// m, and the frac flag, are part of the identity.
 	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") != miint::krepp_detail::PartialHashConfig("-m8r1-frac"));
 	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") !=
@@ -268,13 +288,24 @@ TEST_CASE("PartialHashConfig keeps m and frac and drops the residue", "[krepp]")
 	// a single digit of m instead of the whole run passes every other assertion
 	// in this file and in the SQL tests - all of which use a one-digit m - and
 	// then rejects a real two-residue m := 64 build as two different indexes.
-	CHECK(miint::krepp_detail::PartialHashConfig("-m64r1-frac") ==
-	      miint::krepp_detail::PartialHashConfig("-m64r2-frac"));
+	CHECK(miint::krepp_detail::PartialHashConfig("-m64r1-no_frac") ==
+	      miint::krepp_detail::PartialHashConfig("-m64r2-no_frac"));
 	// Anything that is not that shape groups only with itself, rather than
 	// being merged with a partial it has nothing to do with.
 	CHECK(miint::krepp_detail::PartialHashConfig("-nonsense") == "-nonsense");
 	CHECK(miint::krepp_detail::PartialHashConfig("-mr1-frac") == "-mr1-frac");
 	CHECK(miint::krepp_detail::PartialHashConfig("-m4r-frac") == "-m4r-frac");
+}
+
+TEST_CASE("PartialHashConfig keeps the residue of a frac := true partial", "[krepp]") {
+	// What must agree depends on frac. Under frac := false, r says which partial
+	// this is and is dropped. Under frac := true it is a threshold that krepp
+	// compares across partials (ext/krepp/src/lshf.cpp:163-170), so it stays part
+	// of the identity.
+	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") == "-m4r1-frac");
+	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") != miint::krepp_detail::PartialHashConfig("-m4r2-frac"));
+	CHECK(miint::krepp_detail::PartialHashConfig("-m64r1-frac") !=
+	      miint::krepp_detail::PartialHashConfig("-m64r2-frac"));
 }
 
 TEST_CASE("ValidateIndexLayout rejects an incomplete index", "[krepp]") {

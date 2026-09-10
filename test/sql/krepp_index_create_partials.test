@@ -13,17 +13,17 @@ require-env MIINT_KREPP_TOY_REFS
 # index hundreds of thousands of genomes is one residue per job, every job
 # writing into the SAME directory with m, k, w, h and frac held fixed. krepp
 # then loads every distinct suffix it finds there as a partial
-# (ext/krepp/src/krepp.cpp:43-77) and compares only the hash function, reading
-# `r` without comparing it (ext/krepp/src/index.cpp:73-86).
+# (ext/krepp/src/krepp.cpp:43-77) and, under frac := false, compares the hash
+# configuration without comparing `r` (LSHF::check_compatible,
+# ext/krepp/src/lshf.cpp:163-170).
 #
 # frac := false is not incidental here. Under the default frac := true, `-r` is
 # a cumulative THRESHOLD and not a selector: rqseq.cpp:133 keeps a k-mer when
 # `rix_res <= r`, and index.cpp:146-148 registers the partial under every
-# residue from 0 to r. Residues built that way NEST rather than partition - the
-# largest covers the whole space by itself, the smaller ones are overwritten at
-# load, and this file could not tell three partials from one. Partitioning the
-# work across jobs needs --no-frac. The default is left alone because it is
-# krepp's own default.
+# residue from 0 to r. Residues built that way NEST rather than partition, and
+# krepp refuses to load two of them together - the last case in this file.
+# Partitioning the work across jobs needs --no-frac. The default is left alone
+# because it is krepp's own default.
 #
 # Both halves of the round trip were previously blocked by miint:
 # krepp_index_create refused any non-empty output_path, and place_krepp's layout
@@ -156,3 +156,31 @@ statement error
 SELECT status FROM krepp_index_create('refs', '__TEST_DIR__/idx_wgap', tree_table := 'backbone', k := 25, m := 4, r := 2, frac := false);
 ----
 holds partials built with w := 40, but this build uses w := 31
+
+# frac := true is the other shape, and it does not split. r is a cumulative
+# threshold there (ext/krepp/src/rqseq.cpp:133), and krepp refuses to load two
+# frac := true partials that differ in it (LSHF::check_compatible,
+# ext/krepp/src/lshf.cpp:163-170), so such an index is a single partial and a
+# second one is refused before the build. As above, the expected text reaches
+# into 'vs this build's', which only the pre-build refusal emits.
+query I
+SELECT status FROM krepp_index_create('refs', '__TEST_DIR__/idx_frac', tree_table := 'backbone', k := 25, m := 4, r := 1, frac := true);
+----
+ok
+
+statement error
+SELECT status FROM krepp_index_create('refs', '__TEST_DIR__/idx_frac', tree_table := 'backbone', k := 25, m := 4, r := 2, frac := true);
+----
+different hash configuration ('m4r1-frac' vs this build's 'm4r2-frac')
+
+# Nothing was written by the refused build: one partial's six files, and the
+# directory still places.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/idx_frac/*') WHERE file LIKE '%-frac';
+----
+6
+
+query I
+SELECT count(*) > 0 FROM place_krepp(query_table='toy_reads', index_path='__TEST_DIR__/idx_frac');
+----
+true

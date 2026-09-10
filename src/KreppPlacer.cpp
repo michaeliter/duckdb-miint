@@ -69,7 +69,8 @@ std::map<std::string, std::set<std::string>> DiscoverPartials(const std::string 
 namespace krepp_detail {
 
 std::string PartialHashConfig(const std::string &suffix) {
-	// "-m<M>r<R><rest>" -> "-m<M><rest>". Anything else is returned unchanged.
+	// "-m<M>r<R><rest>" -> "-m<M><rest>", except that a "-frac" suffix keeps its r
+	// (see the header). Anything else is returned unchanged.
 	if (suffix.size() < 2 || suffix[0] != '-' || suffix[1] != 'm') {
 		return suffix;
 	}
@@ -86,6 +87,9 @@ std::string PartialHashConfig(const std::string &suffix) {
 	}
 	if (i == r_begin + 1) {
 		return suffix; // an 'r' with no digits after it is not a residue
+	}
+	if (suffix.compare(i, std::string::npos, "-frac") == 0) {
+		return suffix;
 	}
 	return suffix.substr(0, r_begin) + suffix.substr(i);
 }
@@ -249,10 +253,11 @@ std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::stri
 	// files have been opened and read. It is decidable here, from the filenames,
 	// before anything opens.
 	//
-	// What has to agree is the hash configuration, NOT the whole suffix - see
-	// PartialHashConfig. An earlier version keyed on `-m4r1`, which folded the
-	// residue into the identity and so rejected the ordinary multi-partial
-	// layout: three residues of one index read as three different indexes.
+	// What has to agree is the hash configuration - see PartialHashConfig, which
+	// keeps the residue only under frac := true. An earlier version keyed on
+	// `-m4r1` for every partial, which folded the residue into the identity and so
+	// rejected the ordinary frac := false multi-partial layout: three residues of
+	// one index read as three different indexes.
 	std::set<std::string> hash_configs;
 	for (const auto &entry : partials) {
 		hash_configs.insert(PartialHashConfig(entry.first));
@@ -266,7 +271,9 @@ std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::stri
 		                         " holds krepp indexes built with different hash "
 		                         "configurations (" +
 		                         listed +
-		                         "); krepp would try to load them as one index. Keep one index per directory.");
+		                         "); krepp would try to load them as one index. Partials of one index share m "
+		                         "and frac and differ only in r, which frac := true does not allow: a frac := true "
+		                         "index is a single partial. Keep one index per directory.");
 	}
 
 	// k, w and h are in no filename, so two builds that differ in them are

@@ -168,14 +168,17 @@ std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::stri
 // one index, with the part that is expected to differ removed.
 //
 // krepp builds the suffix as "-m<M>r<R>" + ("-frac"|"-no_frac")
-// (ext/krepp/src/index.cpp:249-251). Only the hash function and the frac flag
-// have to match: Index::load_partial_index reads k, w, h, m, r and frac out of
-// each partial's metadata but compares just LSHF(m, ppos, npos)
-// (ext/krepp/src/index.cpp:73-86) - `r` is read and never compared, because it
-// is the residue that says WHICH partial this is. Splitting several residues of
-// one index across jobs and pointing krepp at the collected directory is the
-// supported way to build a large index, so treating a differing r as a
-// different index refuses layouts that work.
+// (ext/krepp/src/index.cpp:249-251). Index::load_partial_index reads k, w, h, m,
+// r and frac out of each partial's metadata, and LSHF::check_compatible requires
+// m, h, k, frac and the LSH positions to match, plus r when frac is true
+// (ext/krepp/src/lshf.cpp:163-170). So what has to agree depends on frac:
+//   - frac := false: r is the residue that says WHICH partial this is, and is
+//     removed. Splitting the residues of one index across jobs and pointing
+//     krepp at the collected directory is the supported way to build a large
+//     index, so treating a differing r as a different index refuses layouts that
+//     work.
+//   - frac := true: r is a cumulative threshold (ext/krepp/src/rqseq.cpp:133)
+//     and is kept, so a frac := true index is a single partial.
 //
 // Returns the suffix unchanged if it does not have that shape, so an
 // unrecognised name groups only with itself rather than being merged.
