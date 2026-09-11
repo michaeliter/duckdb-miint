@@ -197,8 +197,9 @@ std::string PartialSuffix(uint32_t m, uint32_t r, bool frac);
 // LSHF::check_compatible is fed from (:57-69), and the completeness check above
 // already requires it, so a complete partial always has one. Reading the
 // sidecar instead meant a partial that had lost its .txt was silently skipped,
-// which mattered most for `w`: krepp compares m, h, k and the positions but
-// never w (ext/krepp/src/lshf.cpp:159-163), so this is the only w check there
+// which mattered most for `w`: krepp compares m, h, k, frac, r under
+// frac := true, and the positions, but never w (ext/krepp/src/lshf.cpp:163-170),
+// so this is the only w check there
 // is, and skipping it produced a wrong placement result with no error at all.
 //
 // The layout is fixed and carries no version marker, so m, r and frac are read

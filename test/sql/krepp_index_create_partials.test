@@ -103,10 +103,11 @@ SELECT count(*) > 0 FROM (
 true
 
 # Writing the same residue twice would write over the partial that is there.
+# Under frac := false a different r is a way out, and the message says so.
 statement error
 SELECT status FROM krepp_index_create('refs', '__TEST_DIR__/idx_parts', tree_table := 'backbone', k := 25, m := 4, r := 2, frac := false);
 ----
-already holds the partial this build would write ('-m4r2-no_frac')
+already holds the partial this build would write ('-m4r2-no_frac'). krepp does not clear what is there, so this would write over it. Use a different r, or another path
 
 # A different m is a different hash function. The expected text reaches past the
 # shared phrase into 'vs this build's', which only the PRE-build refusal emits:
@@ -142,9 +143,11 @@ SELECT status FROM krepp_index_create('refs', '__TEST_DIR__/idx_hgap', tree_tabl
 ----
 holds partials built with h := 10, but this build uses h := 9
 
-# w is the worse of the two: LSHF::check_compatible (ext/krepp/src/lshf.cpp:161)
-# compares m, h, k and the positions but never w, and load_partial_index reads w
-# into a local it discards (index.cpp:59-63). A w mismatch is therefore caught
+# w is the worse of the two: LSHF::check_compatible
+# (ext/krepp/src/lshf.cpp:163-170) compares m, h, k, frac, r under frac := true,
+# and the positions, but never w, and load_partial_index uses w only in the info
+# text it assembles when metadata .txt is missing (index.cpp:57-61, :132). A w
+# mismatch is therefore caught
 # nowhere downstream - it just leaves one index holding two different sets of
 # minimizers, with no error at any point.
 query I
@@ -173,7 +176,14 @@ SELECT status FROM krepp_index_create('refs', '__TEST_DIR__/idx_frac', tree_tabl
 ----
 different hash configuration ('m4r1-frac' vs this build's 'm4r2-frac')
 
-# Nothing was written by the refused build: one partial's six files, and the
+# The same frac := true build again is refused as the partial already there, and
+# the message does not offer a different r, which the refusal above rules out.
+statement error
+SELECT status FROM krepp_index_create('refs', '__TEST_DIR__/idx_frac', tree_table := 'backbone', k := 25, m := 4, r := 1, frac := true);
+----
+so this would write over it. Use another path
+
+# Nothing was written by the refused builds: one partial's six files, and the
 # directory still places.
 query I
 SELECT count(*) FROM glob('__TEST_DIR__/idx_frac/*') WHERE file LIKE '%-frac';

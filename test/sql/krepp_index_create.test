@@ -211,6 +211,18 @@ SELECT current_setting('streaming_buffer_size');
 statement ok
 RESET streaming_buffer_size;
 
+# The connection that reads sequence_table does have the cap. A view evaluated
+# there reports that connection's streaming_buffer_size as a reference name,
+# which the name check quotes back when it refuses it.
+
+statement ok
+CREATE VIEW helper_buffer AS SELECT current_setting('streaming_buffer_size') AS read_id, 'ACGT' AS sequence1;
+
+statement error
+SELECT * FROM krepp_index_create('helper_buffer', '__TEST_DIR__/idx_helper_buffer', tree_table := 'backbone');
+----
+reference name '1000 bytes'
+
 # krepp creates its output directory and writes files whose names encode the
 # resolved config; it never clears what is already there. A directory holding
 # unrelated files is not somewhere to build: krepp would write alongside them,
