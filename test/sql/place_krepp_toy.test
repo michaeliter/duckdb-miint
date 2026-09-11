@@ -83,8 +83,8 @@ SELECT count(*) FROM (
 # as a branch, and a negative branch cannot be represented there. Before
 # 31205033 krepp computed it as the Jukes-Cantor distance minus half the edge,
 # and on this index 270 of 404 rows came out negative, down to -0.14971. krepp
-# now floors it at 0 in make_placement (ext/krepp/src/query.cpp), so this clause
-# fails against the older krepp.
+# now floors it at 0 in make_placement (ext/krepp/src/query.cpp). Over the older
+# krepp's output on this index, this clause matches those 270 rows.
 query I
 SELECT count(*)
 FROM place_krepp(query_table='toy_reads', index_path='${MIINT_KREPP_TOY_INDEX}')
@@ -597,6 +597,18 @@ WHERE p.pendant_length > coalesce(b.branch_length, 0.0);
 ----
 true
 
+# pendant_length against distance and distal_length, the other two small doubles
+# on that scale. krepp floors pendant_length at 0 (make_placement,
+# ext/krepp/src/query.cpp:230, :233): on this index 205 of 404 rows sit on that
+# floor, and distance and distal_length are positive on every row. Reading
+# either of them into pendant_length leaves no row like that.
+query I
+SELECT count(*) > 0
+FROM distal_bound_placements
+WHERE pendant_length = 0 AND distance > 0 AND distal_length > 0;
+----
+true
+
 # --- jplace {N} edge decorations -------------------------------------------
 #
 # krepp requires every node decorated or none, and (since v0.9.1) the numbers to
@@ -677,7 +689,7 @@ SELECT (SELECT count(*) FROM place_krepp(query_table='toy_reads',
 ----
 true
 
-# tau gates the placement filter (ext/krepp/src/query.cpp:235, :275: a
+# tau gates the placement filter (ext/krepp/src/query.cpp:247, :295: a
 # candidate survives when the k-mers within tau of it weigh more than 1). It is
 # inert at the default hdist_th on this corpus - 404 rows at tau 0, 1, 2 and 4
 # alike - because every surviving candidate already clears the bar at tau=0.

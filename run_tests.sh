@@ -435,9 +435,9 @@ fi
 # test/sql/place_krepp.test still run.
 #
 # NOTE ON THE BINARY. As of 2026-09-10 bioconda's newest krepp is 0.9.1, while
-# the submodule pins 31205033, which reports v0.10.0 and is not tagged - so
-# `conda install bioconda::krepp` gives a binary older than the linked library.
-# Build it from source at the submodule's commit
+# the submodule pins 31205033, whose VERSION string is v0.10.0 and which is not
+# tagged - so `conda install bioconda::krepp` gives a binary older than the
+# linked library. Build it from source at the submodule's commit
 # (`git clone https://github.com/bo1929/krepp && cd krepp &&
 # git checkout <ext/krepp's commit> && git submodule update --init --recursive
 # && make`). The stamp below records the CLI banner precisely so a mismatch
@@ -448,13 +448,13 @@ fi
 # when one of them moves. Everything lands in data/krepp/, which is gitignored.
 #   - ext/krepp's submodule HEAD, because that is what the extension links.
 #   - the CLI's version banner, because that is what writes the index, and it is
-#     a different build from the linked one (bioconda vs. the submodule).
+#     a different build from the linked one (a separately compiled CLI).
 #   - the sha of the reference tarball, i.e. the input data itself.
 # The banner alone is not enough: it expands PRINT_VERSION, a hardcoded string
-# in common.hpp that only moves on a release. Two commits either side of the
-# generate_tree change both report v0.9.0 while writing incompatible indexes -
-# precisely the drift described above. Same shape as SORTMERNA_REAL_ORACLE,
-# which records the submodule sha for the same reason.
+# in common.hpp that does not change with every commit. Two commits
+# either side of the generate_tree change both report v0.9.0 while writing
+# incompatible indexes - precisely the drift described above. Same shape as
+# SORTMERNA_REAL_ORACLE, which records the submodule sha for the same reason.
 #
 # The index directory is NAMED for the stamp rather than stamped alongside it.
 # `krepp index` only creates the directory and writes files whose names encode

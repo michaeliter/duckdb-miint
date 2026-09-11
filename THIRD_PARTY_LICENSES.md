@@ -506,7 +506,7 @@ k-mer LSH index and maximum pseudo-likelihood phylogenetic placement. Used
 by `place_krepp`. Embedded as a statically linked C++ library built from
 11 of the upstream `src/*.cpp` files; `src/krepp.cpp` (the CLI entry point)
 is excluded. miint reads an index built by krepp's own command-line tool.
-Pinned at commit 31205033 (reports v0.10.0; not tagged upstream).
+Pinned at commit 31205033 (its VERSION string is v0.10.0; not tagged upstream).
 
 - Repository: https://github.com/bo1929/krepp
 - License: MIT

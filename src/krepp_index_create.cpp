@@ -403,9 +403,11 @@ void CheckOutputPathAcceptsPartial(const KreppIndexCreateTableFunction::Data &da
 	try {
 		existing = miint::krepp_detail::ValidateIndexLayout(data.output_path);
 	} catch (const std::exception &e) {
-		// Debris from a build that died partway, an unrelated file, or two
-		// indexes already mixed together. None of those is a directory to add a
-		// partial to, and none of them is ours to clean up.
+		// Debris from a build that died partway, files beside no complete index,
+		// or two indexes already mixed together. None of those is a directory to
+		// add a partial to, and none of them is ours to clean up. Files that are
+		// not index files (DiscoverPartials skips them) do not cause this beside a
+		// complete index: they are left alone and the build goes ahead.
 		throw IOException("%s: output_path '%s' is not empty and does not hold one complete krepp index for this "
 		                  "build to add a partial to (%s). krepp writes alongside whatever is already there, so "
 		                  "building here would leave a mixed directory - remove it or choose another path",
@@ -414,9 +416,12 @@ void CheckOutputPathAcceptsPartial(const KreppIndexCreateTableFunction::Data &da
 
 	const std::string ours = PartialSuffixFor(data.options);
 	if (existing.find(ours) != existing.end()) {
+		// A frac := true index is a single partial (see PartialHashConfig), so a
+		// different r is no way out for it.
 		throw IOException("%s: output_path '%s' already holds the partial this build would write ('%s'). krepp does "
-		                  "not clear what is there, so this would write over it. Use a different r, or another path",
-		                  kCallerName, data.output_path, ours);
+		                  "not clear what is there, so this would write over it. %s",
+		                  kCallerName, data.output_path, ours,
+		                  data.options.frac ? "Use another path" : "Use a different r, or another path");
 	}
 	const std::string our_config = miint::krepp_detail::PartialHashConfig(ours);
 	const std::string their_config = miint::krepp_detail::PartialHashConfig(existing.begin()->first);
@@ -433,15 +438,16 @@ void CheckOutputPathAcceptsPartial(const KreppIndexCreateTableFunction::Data &da
 	// a partial that is already there.
 	//
 	// Compare the EFFECTIVE values, not the ones the caller typed. Unset w and h
-	// are derived from k (ext/krepp/src/index.cpp:236-237), so what has to agree
+	// are derived from k (ext/krepp/src/index.cpp:237-238), so what has to agree
 	// is what krepp will actually use - the partial on disk may have been built
 	// with an explicit h that a later job leaves unset. Gating these on
 	// has_value() let exactly that through: same k, one partial at h := 10 and
 	// the next with h unset (k - 16), accepted here and then rejected by krepp
 	// at query time, long after the build. w is worse - LSHF::check_compatible
-	// (ext/krepp/src/lshf.cpp:161) compares m, h, k and the positions but never
-	// w, so a w mismatch is caught nowhere downstream and just leaves one index
-	// holding two different sets of minimizers.
+	// (ext/krepp/src/lshf.cpp:163-170) compares m, h, k, frac, r under
+	// frac := true, and the positions, but never w, so a w mismatch is caught
+	// nowhere downstream and just leaves one index holding two different sets
+	// of minimizers.
 	//
 	// The positions themselves are drawn from `gen`, which BuildKreppIndex
 	// reseeds to a fixed state before every build - that is what makes two
@@ -557,21 +563,24 @@ unique_ptr<GlobalTableFunctionState> KreppIndexCreateTableFunction::InitGlobal(C
 		// second caller wants the same per-row rejections.
 		auto conn = MakeReadOnlyHelperConnection(context);
 		// DuckDB pauses the producer of a streaming result once the chunks
-		// buffered for Fetch reach streaming_buffer_size, as counted by
-		// Vector::GetAllocationSize, which is 16 bytes a row for VARCHAR however
-		// long the strings are (duckdb/src/common/types/vector.cpp:895). At the
-		// default 976.5 KiB, peak RSS while the FASTA were written grew with the
-		// sequence bytes: 2.05 GiB for 400 random 4 Mbp genomes, 3.73 GiB for 800
-		// (m := 64, r := 0, frac := false, threads := 8). At 1KB it was 0.79 and
-		// 0.81 GiB, against 0.76 GiB for a plain scan of the same Parquet file;
-		// the index files were byte-identical, and krepp's build started after
-		// 51 s and 101 s instead of 44 s and 89 s. The setting is local to this
-		// connection.
-		auto buffer_setting = conn.Query("SET streaming_buffer_size = '1KB'");
-		if (buffer_setting->HasError()) {
-			throw InternalException("%s: failed to limit the stream buffer: %s", kCallerName,
-			                        buffer_setting->GetError());
-		}
+		// buffered for Fetch reach streaming_buffer_size - all of it, or a fixed
+		// share of it when the plan uses the batched collector - and sizes each
+		// chunk with Vector::GetAllocationSize, which is 16 bytes a row for VARCHAR
+		// however long the strings are (duckdb/src/common/types/vector.cpp:895). At
+		// the default 976.5 KiB, with sequence_table a view over Parquet, peak RSS
+		// while the FASTA were written grew with the sequence bytes: 2.05 GiB for
+		// 400 random 4 Mbp genomes, 3.73 GiB for 800 (m := 64, r := 0,
+		// frac := false, threads := 8). At 1,000 bytes it was 0.79 and 0.81 GiB,
+		// against 0.76 GiB for a plain scan of the same Parquet file; the index
+		// files other than the timestamped metadata .txt were byte-identical, and
+		// krepp's build started after 51 s and 101 s instead of 44 s and 89 s. As a
+		// read_fastx view over the same 800 genomes, the feed peaked at 3.13 GiB
+		// uncapped and 0.46 GiB capped, against 0.43 GiB for a plain scan of the
+		// view, with the same index files other than the metadata .txt. Written into
+		// this connection's ClientConfig rather than through SET, which
+		// lock_configuration refuses (DBConfig::CheckLock); no other connection
+		// sees it.
+		ClientConfig::GetConfig(*conn.context).streaming_buffer_size = 1000;
 		// Cast to VARCHAR so a BIGINT read_id and a text one reach krepp the
 		// same way; a reference name is text on both sides of the map.
 		// sequence2 is selected only to refuse it. A krepp reference is one

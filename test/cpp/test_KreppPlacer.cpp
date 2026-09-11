@@ -153,9 +153,9 @@ std::filesystem::path FreshDir(const std::string &name) {
 TEST_CASE("ValidateIndexLayout rejects two hash configurations in one directory", "[krepp]") {
 	// `krepp index` writes into an existing directory without clearing it, so
 	// re-indexing with different -h/-w leaves both file sets behind. krepp loads
-	// every complete group it finds and only notices the mismatch inside
-	// Index::check_compatible, which reports it with error_exit. The suffix says
-	// it first.
+	// every complete group it finds and only notices the mismatch inside its
+	// partial loaders (ext/krepp/src/index.cpp:26, :47, :86), which report it with
+	// error_exit. The suffix says it first.
 	// frac := false, so m is the only thing separating the two: under frac := true
 	// their different r would reject them on its own.
 	const std::filesystem::path dir = FreshDir("twocfg");
@@ -209,9 +209,10 @@ TEST_CASE("ValidateIndexLayout rejects several frac := true partials", "[krepp]"
 
 TEST_CASE("ValidateIndexLayout rejects partials that disagree on w", "[krepp]") {
 	// w gets its own case because this check is the ONLY one anywhere. krepp
-	// compares m, h, k and the two position vectors and never w
-	// (ext/krepp/src/lshf.cpp:159-163), and load_partial_index reads w into a
-	// local it discards (index.cpp:57-61). So unlike k and h, a differing w
+	// compares m, h, k, frac, r under frac := true, and the two position vectors,
+	// and never w (ext/krepp/src/lshf.cpp:163-170), and load_partial_index uses w only
+	// in the info text it assembles when metadata .txt is missing (index.cpp:57-61,
+	// :132). So unlike k and h, a differing w
 	// produces no error at any later point - just one index quietly holding two
 	// different sets of minimizers, and a placement result that is wrong rather
 	// than absent. Measured on a real pair: 148 rows against 140, with 13
@@ -276,13 +277,15 @@ TEST_CASE("PartialHashConfig keeps m and frac and drops a frac := false residue"
 	      miint::krepp_detail::PartialHashConfig("-m4r2-no_frac"));
 	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-no_frac") ==
 	      miint::krepp_detail::PartialHashConfig("-m4r16-no_frac"));
-	// m, and the frac flag, are part of the identity.
-	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") != miint::krepp_detail::PartialHashConfig("-m8r1-frac"));
+	// m, and the frac flag, are part of the identity. The m checks use -no_frac,
+	// the one shape whose residue is stripped, so the stripping is what they test.
+	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-no_frac") !=
+	      miint::krepp_detail::PartialHashConfig("-m8r1-no_frac"));
 	CHECK(miint::krepp_detail::PartialHashConfig("-m4r1-frac") !=
 	      miint::krepp_detail::PartialHashConfig("-m4r1-no_frac"));
 	// Multi-digit m must not be confused with the residue.
-	CHECK(miint::krepp_detail::PartialHashConfig("-m64r1-frac") !=
-	      miint::krepp_detail::PartialHashConfig("-m6r1-frac"));
+	CHECK(miint::krepp_detail::PartialHashConfig("-m64r1-no_frac") !=
+	      miint::krepp_detail::PartialHashConfig("-m6r1-no_frac"));
 	// ...and must still group with its OWN residues. The line above only rules
 	// out a false merge; without this one a false split goes unnoticed. Parsing
 	// a single digit of m instead of the whole run passes every other assertion

@@ -179,7 +179,7 @@ void ReadPartialConfig(const std::string &path, const std::string &expect_suffix
 		throw std::runtime_error("krepp metadata " + path + " could not be opened");
 	}
 	// Field order and widths are krepp's, read the same way it reads them
-	// (ext/krepp/src/index.cpp:57-63). Only the first six are needed; nrows and
+	// (ext/krepp/src/index.cpp:57-65). Only the first six are needed; nrows and
 	// the position vectors follow and are left alone.
 	uint8_t k_raw = 0, w_raw = 0, h_raw = 0;
 	uint32_t m_raw = 0, r_raw = 0;
@@ -246,9 +246,10 @@ std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::stri
 	// (ext/krepp/src/krepp.cpp:43-77 collects every distinct suffix and calls
 	// load_partial_index on each). Two *different* indexes in one directory are
 	// not: `krepp index` never clears what is already there, so re-indexing with
-	// new parameters leaves both behind. krepp discovers that only inside
-	// Index::check_compatible, which reports it with error_exit (index.cpp:26,
-	// :47, :86). InstallKreppErrorHandler turns that into an exception rather
+	// new parameters leaves both behind. krepp discovers that only inside its
+	// partial loaders (Index::generate_partial_tree, load_partial_tree and
+	// load_partial_index), which report it with error_exit (index.cpp:26, :47,
+	// :86). InstallKreppErrorHandler turns that into an exception rather
 	// than a std::exit, so it surfaces as a DuckDB error - but only after the
 	// files have been opened and read. It is decidable here, from the filenames,
 	// before anything opens.
@@ -279,8 +280,9 @@ std::map<std::string, std::set<std::string>> ValidateIndexLayout(const std::stri
 	// k, w and h are in no filename, so two builds that differ in them are
 	// indistinguishable above. That matters in both directions. krepp catches k
 	// and h itself inside LSHF::check_compatible, but only once the files are
-	// open - and it never compares w at all (ext/krepp/src/lshf.cpp:159-163),
-	// reading it into a local it discards (index.cpp:59-63), so a differing w is
+	// open - and it never compares w at all (ext/krepp/src/lshf.cpp:163-170),
+	// using it only in the info text it assembles when metadata .txt is missing
+	// (index.cpp:57-61, :132), so a differing w is
 	// caught nowhere and simply leaves one index holding two different sets of
 	// minimizers. Compare all three here, from the binary metadata krepp itself
 	// reads, before anything is loaded.
@@ -324,12 +326,13 @@ struct SharedKreppIndex::Impl {
 };
 
 SharedKreppIndex::SharedKreppIndex(const std::string &index_dir, const std::string &newick_path) : impl_(new Impl()) {
-	// krepp reports failures through error_exit, which calls std::exit and
-	// would terminate the host process rather than raising. Paths and the
-	// index file set are checked here so the common mistakes surface as
-	// exceptions. Errors in the *content* of an index - partials built against
-	// different trees or incompatible hash functions - are still fatal to the
-	// process, because krepp only discovers them mid-load.
+	// krepp reports failures through error_exit, which InstallKreppErrorHandler
+	// turns into a thrown KreppFatalError rather than std::exit. Paths and the
+	// index file set are still checked here, so the common mistakes are refused
+	// before anything opens and with a message naming the file. Errors in the
+	// *content* of an index - partials built against different trees or with
+	// incompatible hash configurations - reach krepp's error_exit mid-load
+	// (ext/krepp/src/index.cpp:26, :47, :86) and surface as that error.
 	const auto partials = krepp_detail::ValidateIndexLayout(index_dir);
 	std::error_code ec;
 
@@ -395,7 +398,7 @@ SharedKreppIndex::SharedKreppIndex(const std::string &index_dir, const std::stri
 		for (uint32_t node = 0; node < tree.num_nodes(); ++node) {
 			// jplace {N} edge decorations. krepp requires every node decorated or
 			// none (Tree::load, ext/krepp/src/phytree.cpp:446-449) and, since
-			// v0.9.1, that the numbers are unique (:437-443). Both are error_exit.
+			// v0.9.1, that the numbers are unique (:440-443). Both are error_exit.
 			//
 			// Safe to check with miint's parser because the one form it reads -
 			// {N} after the branch length, the jplace spec's own - is a form krepp
@@ -406,7 +409,7 @@ SharedKreppIndex::SharedKreppIndex(const std::string &index_dir, const std::stri
 			if (edge_id.has_value()) {
 				++decorated;
 				// krepp narrows the decoration to uint32 (`static_cast<se_t>(std::atol(...))`,
-				// ext/krepp/src/phytree.cpp:232, with se_t = uint32_t at common.hpp:64) while
+				// ext/krepp/src/phytree.cpp:232, with se_t = uint32_t at common.hpp:67) while
 				// miint's parser reads it as int64. Without this bound {-5} would be reported
 				// back as 4294967291 - breaking the contract that these numbers are echoed
 				// verbatim - and {-1} would collide with {4294967295} inside krepp while
@@ -489,7 +492,7 @@ SharedKreppIndex::SharedKreppIndex(const std::string &index_dir, const std::stri
 		// only diagnostic is commented out (phytree.cpp:500-506). Every skipped
 		// leaf leaves eff_nchildren at 0, and collect_placements then rejects
 		// every candidate on the `get_nchildren() != get_eff_nchildren()` test
-		// (query.cpp:272). A backbone whose labels do not match the index is
+		// (query.cpp:292). A backbone whose labels do not match the index is
 		// therefore not an error anywhere in krepp: it is zero rows, no warning,
 		// indistinguishable from "nothing placed". Count the overlap ourselves.
 		impl_->backbone->reset_traversal();
